@@ -14,6 +14,13 @@ excel_file = st.sidebar.file_uploader(
     type=["xlsx", "xls"]
 )
 
+st.sidebar.header("Display / Logic")
+click_tol_frac = st.sidebar.slider("Click tolerance (fraction of S2 range)", 0.0, 0.2, 0.02, 0.005)
+grid_density = st.sidebar.number_input("Grid density (S1 & S2)", min_value=51, max_value=1001, value=201, step=50)
+apply_s2_cap = st.sidebar.checkbox("Apply S2 hard cap from sidebar", value=False)
+s2_cap_value = st.sidebar.number_input("S2 hard cap value (if enabled)", value=100.0)
+show_heat = st.sidebar.checkbox("Show feasibility heat", value=True)
+
 # ---------------- Helpers ----------------
 def norm(s: str) -> str:
     return "".join(ch for ch in str(s).strip().lower().replace("-", "_").replace(" ", "_") if ch.isalnum() or ch == "_")
