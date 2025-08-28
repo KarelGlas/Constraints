@@ -165,7 +165,121 @@ if vertices:
         )
     )
 
+# ---- HYBRID DF = base + selected shadows (override same-named, add if new) ----
+hybrid = df[[x_col] + y_select].copy()
+effective_y = list(y_select)
 
+if (shadow_df is not None) and shadow_cols_select:
+    # align shadows to main X
+    aligned = pd.merge(
+        df[[x_col]],
+        shadow_df[[x_col] + shadow_cols_select],
+        on=x_col, how="left"
+    )
+
+    for s_col in shadow_cols_select:
+        series = pd.to_numeric(aligned[s_col], errors="coerce")
+        if s_col in hybrid.columns:
+            # replace base constraint with shadow
+            hybrid[s_col] = series
+        else:
+            # add new constraint
+            hybrid[s_col] = series
+            effective_y.append(s_col)
+
+    # keep only columns used
+    hybrid = hybrid[[x_col] + effective_y]
+
+old_vertices = compute_feasible_polygon(df, x_col, y_select, sense=sense, baseline=baseline)
+new_vertices = compute_feasible_polygon(hybrid, x_col, effective_y, sense=sense, baseline=baseline)
+
+# Try boolean polygon difference
+try:
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+    have_shapely = True
+except Exception:
+    have_shapely = False
+
+def _poly_from_vertices(verts):
+    if not verts or len(verts) < 3:
+        return None
+    # ensure closed, remove NaNs
+    xs, ys = zip(*verts)
+    return Polygon(list(zip(xs, ys)))
+
+if have_shapely and old_vertices and new_vertices:
+    poly_old = _poly_from_vertices(old_vertices)
+    poly_new = _poly_from_vertices(new_vertices)
+
+    if poly_old and poly_new and (not poly_new.is_empty):
+        delta = poly_new.difference(poly_old)  # what’s newly feasible
+
+        # Plot delta (may be MultiPolygon)
+        geoms = list(delta.geoms) if delta.geom_type == "MultiPolygon" else [delta]
+        for g in geoms:
+            if g.is_empty:
+                continue
+            x, y = g.exterior.xy
+            custom_out = (np.array(x) + np.array(y)).tolist()  # X+Y for hover
+            fig.add_trace(
+                go.Scatter(
+                    x=x, y=y,
+                    fill='toself',
+                    fillcolor='rgba(250,150,150,0.35)',  # red-ish delta
+                    line=dict(color='red', width=1, dash='dot'),
+                    name="Added Feasible Area",
+                    customdata=custom_out,
+                    hovertemplate=(
+                        "Added feasible area<br>"
+                        + f"{x_col}=%{{x}}<br>"
+                          "Constraint=%{y}<br>"
+                          "Output (X+Y)=%{customdata}<br>"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+        # also outline new total feasible region (optional)
+        nx, ny = zip(*new_vertices)
+        fig.add_trace(
+            go.Scatter(
+                x=list(nx)+[nx[0]], y=list(ny)+[ny[0]],
+                mode='lines',
+                line=dict(color='red', width=1),
+                name="Feasible (Hybrid) outline",
+                hoverinfo='skip'
+            )
+        )
+    else:
+        st.warning("Feasible polygon(s) invalid; skipping delta shading.")
+else:
+    # Fallback: draw old and new polygons (no delta), with a note
+    if new_vertices:
+        nx, ny = zip(*new_vertices)
+        fig.add_trace(
+            go.Scatter(
+                x=list(nx)+[nx[0]], y=list(ny)+[ny[0]],
+                fill='toself',
+                fillcolor='rgba(150,150,250,0.25)',
+                line=dict(color='blue', width=1),
+                name="Feasible (Hybrid)",
+                hoverinfo='skip'
+            )
+        )
+    if old_vertices:
+        ox, oy = zip(*old_vertices)
+        fig.add_trace(
+            go.Scatter(
+                x=list(ox)+[ox[0]], y=list(oy)+[oy[0]],
+                mode='lines',
+                line=dict(color='gray', width=1, dash='dash'),
+                name="Feasible (Old)",
+                hoverinfo='skip'
+            )
+        )
+    if not have_shapely:
+        st.info("Install shapely to show only the added feasible area: `pip install shapely`.")
 
 # Shadow scenario — only selected columns (with X+Y tooltip)
 if show_shadow:
