@@ -165,25 +165,7 @@ if vertices:
         )
     )
 
-# Hover tips (transparent markers around midpoints)
-n = len(df)
-mid_idx = n // 2 if n > 0 else 0
-for col in y_select:
-    if n == 0 or mid_idx >= n:
-        continue
-    mid_x = df[x_col].iloc[mid_idx]
-    mid_y = df[col].iloc[mid_idx]
-    fig.add_trace(
-        go.Scatter(
-            x=[mid_x],
-            y=[mid_y],
-            mode='markers',
-            marker=dict(opacity=0, size=12),
-            showlegend=False,
-            hoverinfo='text',
-            hovertext=f"Raise <b>{col}</b> limit to increase output"
-        )
-    )
+
 
 # Shadow scenario — only selected columns (with X+Y tooltip)
 if show_shadow:
