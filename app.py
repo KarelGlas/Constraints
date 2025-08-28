@@ -123,6 +123,9 @@ if apply_s2_cap:
     s2_cap = float(s2_cap_value)
 else:
     s2_cap = None
+pad = 0.05 * max(1e-9, S2_max - S2_min)
+y_min_viz = S2_min - pad
+y_max_viz = S2_max + pad
 
 # Interpolator from Excel
 def interp_from_excel(colname: str, delta: float = 0.0):
@@ -169,33 +172,47 @@ area_feasible = max(area_feasible, 0.0)
 colL, colR = st.columns([0.62, 0.38])
 with colL:
     st.markdown("### Production Capacity Map (Excel-driven)")
+
     fig = go.Figure()
+
     if show_heat:
         z = feasible.astype(int)
         fig.add_trace(go.Heatmap(
             x=S1, y=S2_vals, z=z, showscale=False, opacity=0.25,
             hovertemplate="S1=%{x:.2f}<br>S2=%{y:.2f}<br>Feasible=%{z}<extra></extra>"
         ))
-    # Envelope
+
+    # Envelope (draw on top, thicker, dashed)
     fig.add_trace(go.Scatter(
-        x=S1, y=np.clip(envelope, S2_min, S2_max), mode="lines",
-        name="Feasible envelope"
+        x=S1, y=envelope, mode="lines", name="Feasible envelope",
+        line=dict(width=3, dash="dash"), connectgaps=True
     ))
-    # Individual constraints
+
+    # Individual constraints (thick, connect gaps)
     for i, c in enumerate(constraints):
         fig.add_trace(go.Scatter(
-            x=S1, y=np.clip(curves[i], S2_min, S2_max),
+            x=S1, y=curves[i],
             mode="lines", name=f"{c} (lvl {st.session_state.levels.get(c,0)})",
+            line=dict(width=2.5),
+            connectgaps=True,
             hovertemplate=f"{c}: S2_max=%{{y:.2f}}"
         ))
+
     fig.update_layout(
-        xaxis_title="Stream 1 (S1)",
-        yaxis_title="Stream 2 (S2)",
-        margin=dict(l=10, r=10, t=10, b=10),
-        height=650
+        height=650,
+        margin=dict(l=90, r=30, t=30, b=80),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        hovermode="x unified",
+        xaxis=dict(title="Stream 1 (S1)", automargin=True, title_standoff=12),
+        yaxis=dict(title="Stream 2 (S2)", automargin=True, title_standoff=12, range=[y_min_viz, y_max_viz])
     )
-    clicked = plotly_events(fig, click_event=True, hover_event=False, select_event=False,
-                            override_height=650, override_width="100%")
+
+    clicked = plotly_events(
+        fig,
+        click_event=True, hover_event=False, select_event=False,
+        override_height=650, override_width="100%"
+    )
+
 
 # Click → pick constraint
 def identify_clicked_constraint(pt):
