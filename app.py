@@ -54,14 +54,15 @@ long_df = plot_df.melt(id_vars=x_col, value_vars=y_cols, var_name="Series", valu
 # Plot
 fig = px.line(long_df, x=x_col, y="Value", color="Series", markers=False)
 fig.update_traces(line=dict(width=4))  # thick lines
+
+# Hard limits: axes start at 0
 fig.update_layout(
     template="plotly_white",
     hovermode="x unified",
     legend_title_text="",
     margin=dict(l=10, r=10, t=40, b=10),
+    xaxis=dict(range=[0, long_df[x_col].max()]),
+    yaxis=dict(range=[0, long_df["Value"].max()])
 )
-st.plotly_chart(fig, use_container_width=True)
 
-# Optional: download
-csv = long_df.to_csv(index=False).encode("utf-8")
-st.sidebar.download_button("Download plotted data (CSV)", csv, file_name="plotted_data.csv", mime="text/csv")
+st.plotly_chart(fig, use_container_width=True)
