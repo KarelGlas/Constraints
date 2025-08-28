@@ -3,3 +3,4 @@ plotly
 shapely
 numpy
 streamlit-plotly-events
+openpyxl
