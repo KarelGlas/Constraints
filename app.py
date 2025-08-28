@@ -95,7 +95,7 @@ if len(y_select) == 0:
 
 # Feasibility settings
 baseline = st.sidebar.number_input("Baseline (other bound)", value=32.0, step=1.0, help="Lower bound for ‘≤’, upper bound for ‘≥’.")
-sense = ‘≥’
+sense = "≥"
 
 # Shadow scenario — column selector (replaces binary toggle)
 shadow_df = None
