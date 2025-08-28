@@ -20,42 +20,47 @@ sheet = st.sidebar.selectbox("Select sheet", xlsx.sheet_names)
 @st.cache_data
 def load_df(file, sheet_name):
     df = pd.read_excel(file, sheet_name=sheet_name)
-    if "S1" in df.columns:
-        xcol = "S1"
-    else:
-        xcol = df.columns[0]
+    xcol = "S1" if "S1" in df.columns else df.columns[0]
     return df, xcol
 
 df, xcol = load_df(uploaded, sheet)
 
-# ---- Column selection ----
-numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-ycols = st.sidebar.multiselect("Series to show", [c for c in numeric_cols if c != xcol],
-                               default=[c for c in numeric_cols if c != xcol])
+# ---- Series selection ----
+num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+ycols = [c for c in num_cols if c != xcol]
+default_sel = ycols if ycols else []
+sel = st.sidebar.multiselect("Series to show", ycols, default=default_sel)
 
-if not ycols:
-    st.warning("Select at least one Y series in the sidebar.")
+if not sel:
+    st.warning("⚠ Please select at least one Y series.")
     st.stop()
 
+# ---- Constraint sets (explicit) ----
+st.sidebar.markdown("**Constraint sets**")
+upper_set = st.sidebar.multiselect("Upper (≤)", sel)
+lower_set = st.sidebar.multiselect("Lower (≥)", [c for c in sel if c not in upper_set])
 
-# ---- Prepare data (sorted X for correct interpolation) ----
+# ---- Prepare data ----
 work = df[[xcol] + sel].dropna().copy()
 work = work.sort_values(by=xcol).reset_index(drop=True)
 X = work[xcol].to_numpy()
 
-# ---- Base figure (single) ----
+# ---- Base figure ----
 long_df = work.melt(id_vars=xcol, var_name="Series", value_name="Value")
 fig = px.line(long_df, x=xcol, y="Value", color="Series")
 fig.update_traces(line=dict(width=4))
-xmax = float(long_df[xcol].max()); ymax = float(long_df["Value"].max())
+
+xmax = float(long_df[xcol].max())
+ymax = float(long_df["Value"].max())
 fig.update_layout(
-    template="plotly_white", hovermode="x unified",
+    template="plotly_white",
+    hovermode="x unified",
     xaxis=dict(range=[0, xmax], title=str(xcol)),
     yaxis=dict(range=[0, ymax], title="Value"),
     margin=dict(l=10, r=10, t=40, b=10)
 )
 
-# ---- Click interaction: pick interval [x1, x2] ----
+# ---- Click interaction ----
 if "clicks" not in st.session_state:
     st.session_state.clicks = []
 st.caption("Click twice on the chart to select an x-interval. Third click resets.")
@@ -66,46 +71,35 @@ if events:
     if len(st.session_state.clicks) > 2:
         st.session_state.clicks = [x_clicked]  # reset
 
-# ---- Shade feasible band within interval ----
+# ---- Feasible band ----
 if len(st.session_state.clicks) == 2 and (upper_set or lower_set):
     x1, x2 = sorted(st.session_state.clicks)
-    # grid clipped to axes ≥0
     gx = np.linspace(max(0, X.min(), x1), max(0, x2), 600)
 
-    # interpolate all selected series on the grid
     vals = {c: np.interp(gx, X, work[c].to_numpy()) for c in sel}
 
-    # envelopes
     if upper_set:
         up = np.minimum.reduce([vals[c] for c in upper_set])
     else:
         up = np.full_like(gx, np.inf, dtype=float)
 
-    low_components = [np.zeros_like(gx)]  # y >= 0
+    low_parts = [np.zeros_like(gx)]
     if lower_set:
-        low_components += [vals[c] for c in lower_set]
-    low = np.maximum.reduce(low_components)
+        low_parts += [vals[c] for c in lower_set]
+    low = np.maximum.reduce(low_parts)
 
-    # feasible mask (clip at y>=0)
     mask = up >= low
     gx_f, up_f, low_f = gx[mask], np.clip(up[mask], 0, None), np.clip(low[mask], 0, None)
 
     if gx_f.size > 0:
-        # add only the filled area (no extra visible lines/legend)
-        fig.add_scatter(
-            x=gx_f, y=up_f, mode="lines", line=dict(width=0),
-            hoverinfo="skip", showlegend=False
-        )
-        fig.add_scatter(
-            x=gx_f, y=low_f, mode="lines", line=dict(width=0),
-            fill="tonexty", fillcolor="rgba(255,0,0,0.28)",
-            hoverinfo="skip", name="Feasible area"
-        )
+        fig.add_scatter(x=gx_f, y=up_f, mode="lines", line=dict(width=0),
+                        hoverinfo="skip", showlegend=False)
+        fig.add_scatter(x=gx_f, y=low_f, mode="lines", line=dict(width=0),
+                        fill="tonexty", fillcolor="rgba(255,0,0,0.28)",
+                        hoverinfo="skip", name="Feasible area")
 
 # ---- Render ----
 st.plotly_chart(fig, use_container_width=True)
 
-# Controls
-cols = st.columns(2)
-if cols[0].button("Reset selection"):
+if st.button("Reset selection"):
     st.session_state.clicks = []
