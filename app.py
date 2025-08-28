@@ -75,33 +75,73 @@ for c in cfg["constraints"]:
 
 colL, colR = st.columns([0.62, 0.38])
 
-# ---------- Load Excel ----------
-excel_df = None
-if excel_file:
-    try:
-        excel_df = pd.read_excel(excel_file)
-    except Exception as e:
-        st.error(f"Excel read error: {e}")
-        st.stop()
 
 # Validate Excel format
-if excel_df is not None:
-    if "S1" not in excel_df.columns:
-        st.error("Excel must have column 'S1'. Other columns = constraints.")
+# ---------- Load & validate Excel with robust name matching ----------
+def norm(s: str) -> str:
+    return "".join(ch for ch in str(s).strip().lower().replace("-", "_").replace(" ", "_") if ch.isalnum() or ch=="_")
+
+excel_df = None
+excel_map = {}   # maps JSON constraint name -> actual Excel column
+
+if excel_file:
+    excel_df = pd.read_excel(excel_file)
+    # normalize column index
+    excel_df.columns = [c if isinstance(c, str) else str(c) for c in excel_df.columns]
+    excel_cols_norm = {norm(c): c for c in excel_df.columns}
+    # require S1 (any case/spacing)
+    s1_key = None
+    for k,v in excel_cols_norm.items():
+        if k in ("s1","stream1","x","stream_1"):
+            s1_key = v; break
+    if not s1_key:
+        st.error("Excel must contain column for S1 (accepted headers: S1 / Stream1 / X / Stream_1).")
         st.stop()
-    # sort and drop dups
-    excel_df = excel_df.sort_values("S1").drop_duplicates("S1")
-    excel_s1 = excel_df["S1"].values
+    # coerce S1
+    excel_df[s1_key] = pd.to_numeric(excel_df[s1_key], errors="coerce")
+    excel_df = excel_df.dropna(subset=[s1_key]).sort_values(s1_key).drop_duplicates(s1_key)
+    excel_df = excel_df.rename(columns={s1_key: "S1"})
+
+    # build mapping for constraints of type 'excel_column'
+    missing = []
+    for c in cfg["constraints"]:
+        if c.get("type","excel_column") != "excel_column":
+            continue
+        want = c["name"]
+        want_norm = norm(want)
+        if want_norm in excel_cols_norm:
+            excel_map[want] = excel_cols_norm[want_norm]
+        else:
+            # heuristic suggestions: contains or startswith
+            candidates = [col for nk,col in excel_cols_norm.items() if want_norm in nk or nk in want_norm or nk.startswith(want_norm[:4])]
+            if candidates:
+                excel_map[want] = candidates[0]  # best guess
+                st.warning(f"Mapping '{want}' → '{candidates[0]}' (auto). Verify header names.")
+            else:
+                excel_map[want] = None
+                missing.append(want)
+
+    if missing:
+        st.error(f"Missing constraint columns in Excel: {missing}. "
+                 "Rename headers to match JSON names or adjust JSON.")
 else:
-    # if no Excel, synthesize defaults so the app still runs
+    # fallback synthetic to keep app usable
     excel_s1 = np.arange(cfg["s1_min"], cfg["s1_max"] + cfg["s1_step"], cfg["s1_step"])
     excel_df = pd.DataFrame({"S1": excel_s1})
-    # create placeholders for any excel_column constraints so plotting works
     for c in cfg["constraints"]:
-        if c["type"] == "excel_column":
-            if c["name"] not in excel_df.columns:
-                # simple fallback profile
-                excel_df[c["name"]] = np.maximum(cfg["s2_max"] - 0.5*(excel_s1 - cfg["s1_min"]), 0.0)
+        if c.get("type","excel_column")=="excel_column":
+            excel_df[c["name"]] = np.maximum(cfg["s2_max"] - 0.5*(excel_s1 - cfg["s1_min"]), 0.0)
+            excel_map[c["name"]] = c["name"]
+
+# helper: interpolator using mapped column
+def interp_from_excel(colname, delta=0.0):
+    mapped = excel_map.get(colname)
+    if mapped is None or mapped not in excel_df.columns:
+        return np.full_like(S1, np.nan)
+    x = excel_df["S1"].values
+    y = pd.to_numeric(excel_df[mapped], errors="coerce").values
+    y = np.nan_to_num(y, nan=np.nanmedian(y) if np.isfinite(np.nanmedian(y)) else 0.0)
+    return np.interp(S1, x, y) + delta
 
 # Build S1 grid for evaluating constraints and area
 S1 = np.linspace(cfg["s1_min"], cfg["s1_max"], cfg.get("grid_density", 101))
