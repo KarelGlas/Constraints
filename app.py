@@ -11,48 +11,66 @@ def sanitize_numeric(df: pd.DataFrame) -> pd.DataFrame:
     for c in out.columns:
         if pd.api.types.is_numeric_dtype(out[c]):
             continue
-        # try parse numeric if possible
         out[c] = pd.to_numeric(out[c], errors="ignore")
     return out
 
 def compute_feasible_polygon(df: pd.DataFrame, x_col: str, y_cols: list,
                              sense: str = "≤", baseline: float = 0.0):
     """
-    Feasible region = points (x,y) where all constraints are satisfied AND x+y > baseline.
+    Feasible region: y between baseline line (x+y>baseline -> y>baseline-x) and
+    the envelope of constraints (min for ≤, max for ≥). Handles NaNs.
     """
     if len(y_cols) == 0 or x_col not in df.columns:
         return []
 
-    work = df[[x_col] + y_cols].dropna().sort_values(by=x_col)
+    work = df[[x_col] + y_cols].sort_values(by=x_col)
     if work.empty:
         return []
 
-    x = work[x_col].values
-    Y = work[y_cols].values  # shape (n, k)
+    x = pd.to_numeric(work[x_col], errors="coerce").to_numpy()
+    # Build Y with smart NaN fill per sense
+    Y_cols = []
+    for c in y_cols:
+        v = pd.to_numeric(work[c], errors="coerce").to_numpy()
+        Y_cols.append(v)
+    if len(Y_cols) == 0:
+        return []
+    Y = np.vstack(Y_cols).T  # shape (n, k)
 
     if sense == "≤":
-        envelope = np.min(Y, axis=1)
-        # baseline curve: lowest allowed y so that x+y > baseline
+        # NaN -> +inf so it won't govern the min
+        Y_min = np.nanmin(np.where(np.isnan(Y), np.inf, Y), axis=1)
         lower = baseline - x
-        feasible_top = np.minimum(envelope, np.max([lower, envelope], axis=0))
-        xs = np.concatenate([x, x[::-1]])
-        ys = np.concatenate([feasible_top, lower[::-1]])
-    else:  # '≥'
-        envelope = np.max(Y, axis=1)
-        upper = baseline - x  # now acts as cap
-        feasible_bottom = np.maximum(envelope, np.min([upper, envelope], axis=0))
-        xs = np.concatenate([x, x[::-1]])
-        ys = np.concatenate([upper, feasible_bottom[::-1]])
+        # Valid only where both finite and a non-empty band exists
+        mask = np.isfinite(x) & np.isfinite(lower) & np.isfinite(Y_min) & (Y_min > lower)
+        if not np.any(mask):
+            return []
+        xf = x[mask]
+        top = Y_min[mask]
+        bot = lower[mask]
+        xs = np.concatenate([xf, xf[::-1]])
+        ys = np.concatenate([top, bot[::-1]])
+    else:
+        # sense '≥'
+        # NaN -> -inf so it won't govern the max
+        Y_max = np.nanmax(np.where(np.isnan(Y), -np.inf, Y), axis=1)
+        upper = baseline - x
+        mask = np.isfinite(x) & np.isfinite(upper) & np.isfinite(Y_max) & (Y_max < upper)
+        if not np.any(mask):
+            return []
+        xf = x[mask]
+        top = upper[mask]
+        bot = Y_max[mask]
+        xs = np.concatenate([xf, xf[::-1]])
+        ys = np.concatenate([top, bot[::-1]])
 
-    mask = np.isfinite(xs) & np.isfinite(ys)
-    xs, ys = xs[mask], ys[mask]
-    if len(xs) < 3:
+    mask2 = np.isfinite(xs) & np.isfinite(ys)
+    xs, ys = xs[mask2], ys[mask2]
+    if xs.size < 3:
         return []
-    return list(zip(xs, ys))
-
+    return list(zip(xs.tolist(), ys.tolist()))
 
 def active_bottleneck(df: pd.DataFrame, x_col: str, y_cols: list, sense: str = "≤"):
-    """Return a Series with the constraint name that governs (min or max) at each x."""
     work = df[[x_col] + y_cols].dropna().sort_values(by=x_col).reset_index(drop=True)
     if work.empty:
         return pd.Series(dtype=object)
@@ -77,7 +95,6 @@ sheet_names = xlsx.sheet_names
 main_candidates = [s for s in sheet_names if s.lower() != 'shadows']
 if not main_candidates:
     main_candidates = sheet_names
-
 main_sheet = st.sidebar.selectbox("Select main scenario sheet", main_candidates)
 
 raw_df = pd.read_excel(uploaded_file, sheet_name=main_sheet)
@@ -97,9 +114,10 @@ if len(y_select) == 0:
 baseline = st.sidebar.number_input("Baseline (other bound)", value=32.0, step=1.0, help="Lower bound for ‘≤’, upper bound for ‘≥’.")
 sense = "≤"
 
-# Shadow scenario — column selector (replaces binary toggle)
+# Shadow scenario — column selector
 shadow_df = None
 shadow_cols_select = []
+shadow_interp = None
 if any(s.lower() == 'shadows' for s in sheet_names):
     shadow_sheet = [s for s in sheet_names if s.lower() == 'shadows'][0]
     shadow_df_raw = pd.read_excel(uploaded_file, sheet_name=shadow_sheet)
@@ -115,21 +133,31 @@ if any(s.lower() == 'shadows' for s in sheet_names):
             default=[],
             help="Pick specific shadow constraints to overlay."
         )
+        # Align shadow to main X (key fix)
+        base_x = pd.to_numeric(df[x_col], errors="coerce")
+        shadow_interp = (
+            shadow_df
+            .assign(**{x_col: pd.to_numeric(shadow_df[x_col], errors="coerce")})
+            .set_index(x_col)
+            .reindex(base_x)
+            .interpolate(method="values")
+            .reset_index(names=x_col)
+        )
 
-show_shadow = bool(shadow_df is not None and x_col in (shadow_df.columns if shadow_df is not None else []) and len(shadow_cols_select) > 0)
+show_shadow = bool(shadow_df is not None and shadow_interp is not None and len(shadow_cols_select) > 0)
 
 # -----------------------------
 # Build figure
 # -----------------------------
 fig = go.Figure()
 
-# Base constraint lines (with hover showing X+Y)
+# Base constraint lines
 for col in y_select:
-    combined_output = df[x_col] + df[col]   # compute X+Y
+    combined_output = pd.to_numeric(df[x_col], errors="coerce") + pd.to_numeric(df[col], errors="coerce")
     fig.add_trace(
         go.Scatter(
-            x=df[x_col],
-            y=df[col],
+            x=pd.to_numeric(df[x_col], errors="coerce"),
+            y=pd.to_numeric(df[col], errors="coerce"),
             name=col,
             mode='lines',
             line=dict(width=3),
@@ -141,21 +169,18 @@ for col in y_select:
                 "<extra></extra>"
             ),
             meta=col,
-            customdata=combined_output,   # feed X+Y values for tooltip
+            customdata=combined_output,
         )
     )
 
-# Feasible region polygon
-vertices = compute_feasible_polygon(df, x_col, y_select, sense=sense, baseline=baseline)
-if vertices:
-    poly_x, poly_y = zip(*vertices)
-    # close polygon
-    poly_x = list(poly_x) + [poly_x[0]]
-    poly_y = list(poly_y) + [poly_y[0]]
+# Feasible region polygon (old)
+old_vertices = compute_feasible_polygon(df, x_col, y_select, sense=sense, baseline=baseline)
+if old_vertices:
+    ox, oy = zip(*old_vertices)
     fig.add_trace(
         go.Scatter(
-            x=poly_x,
-            y=poly_y,
+            x=list(ox)+[ox[0]],
+            y=list(oy)+[oy[0]],
             fill='toself',
             fillcolor='rgba(150,150,250,0.3)',
             line=dict(color='blue', width=1),
@@ -164,38 +189,26 @@ if vertices:
         )
     )
 
-# ---- HYBRID DF = base + selected shadows (override same-named, add if new) ----
+# ---- HYBRID DF = base + selected shadows (aligned & interpolated) ----
 hybrid = df[[x_col] + y_select].copy()
 effective_y = list(y_select)
 
-if (shadow_df is not None) and shadow_cols_select:
-    # align shadows to main X
-    aligned = pd.merge(
-        df[[x_col]],
-        shadow_df[[x_col] + shadow_cols_select],
-        on=x_col, how="left"
-    )
-
+if show_shadow:
     for s_col in shadow_cols_select:
-        series = pd.to_numeric(aligned[s_col], errors="coerce")
+        series = pd.to_numeric(shadow_interp[s_col], errors="coerce")
         if s_col in hybrid.columns:
-            # replace base constraint with shadow
             hybrid[s_col] = series
         else:
-            # add new constraint
             hybrid[s_col] = series
             effective_y.append(s_col)
-
-    # keep only columns used
     hybrid = hybrid[[x_col] + effective_y]
 
-old_vertices = compute_feasible_polygon(df, x_col, y_select, sense=sense, baseline=baseline)
+# New feasible region (hybrid)
 new_vertices = compute_feasible_polygon(hybrid, x_col, effective_y, sense=sense, baseline=baseline)
 
 # Try boolean polygon difference
 try:
     from shapely.geometry import Polygon
-    from shapely.ops import unary_union
     have_shapely = True
 except Exception:
     have_shapely = False
@@ -203,7 +216,6 @@ except Exception:
 def _poly_from_vertices(verts):
     if not verts or len(verts) < 3:
         return None
-    # ensure closed, remove NaNs
     xs, ys = zip(*verts)
     return Polygon(list(zip(xs, ys)))
 
@@ -212,27 +224,19 @@ if have_shapely and old_vertices and new_vertices:
     poly_new = _poly_from_vertices(new_vertices)
 
     if poly_old and poly_new and (not poly_new.is_empty):
-        delta = poly_new.difference(poly_old)  # what’s newly feasible
+        delta = poly_new.difference(poly_old)
 
-        # Plot delta (may be MultiPolygon)
-        geoms = list(delta.geoms) if delta.geom_type == "MultiPolygon" else [delta]
+        geoms = list(delta.geoms) if getattr(delta, "geom_type", "") == "MultiPolygon" else [delta]
         for g in geoms:
             if g.is_empty:
                 continue
-
-            # exterior
-            x_arr, y_arr = g.exterior.xy          # array('d')
-            x = np.asarray(x_arr)                 # -> np.ndarray
+            x_arr, y_arr = g.exterior.xy
+            x = np.asarray(x_arr)
             y = np.asarray(y_arr)
-
-            # optional: handle holes (interiors)
-            # for ring in g.interiors: ... (same conversion)  # if you plan to plot them
-
-            custom_out = (x + y).tolist()         # keep numeric for hover
-
+            custom_out = (x + y).tolist()
             fig.add_trace(
                 go.Scatter(
-                    x=x.tolist(),                 # <- lists or np.ndarray work
+                    x=x.tolist(),
                     y=y.tolist(),
                     fill='toself',
                     fillcolor='rgba(250,150,150,0.35)',
@@ -248,8 +252,6 @@ if have_shapely and old_vertices and new_vertices:
                 )
             )
 
-
-        # also outline new total feasible region (optional)
         nx, ny = zip(*new_vertices)
         fig.add_trace(
             go.Scatter(
@@ -263,7 +265,7 @@ if have_shapely and old_vertices and new_vertices:
     else:
         st.warning("Feasible polygon(s) invalid; skipping delta shading.")
 else:
-    # Fallback: draw old and new polygons (no delta), with a note
+    # Fallback: draw old/new
     if new_vertices:
         nx, ny = zip(*new_vertices)
         fig.add_trace(
@@ -290,14 +292,14 @@ else:
     if not have_shapely:
         st.info("Install shapely to show only the added feasible area: `pip install shapely`.")
 
-# Shadow scenario — only selected columns (with X+Y tooltip)
+# Shadow lines (aligned grid)
 if show_shadow:
     for col in shadow_cols_select:
-        combined_output_shadow = shadow_df[x_col] + shadow_df[col]
+        combined_output_shadow = pd.to_numeric(shadow_interp[x_col], errors="coerce") + pd.to_numeric(shadow_interp[col], errors="coerce")
         fig.add_trace(
             go.Scatter(
-                x=shadow_df[x_col],
-                y=shadow_df[col],
+                x=pd.to_numeric(shadow_interp[x_col], errors="coerce"),
+                y=pd.to_numeric(shadow_interp[col], errors="coerce"),
                 name=f"{col} (Shadow)",
                 mode='lines',
                 line=dict(width=2, dash='dash'),
@@ -313,7 +315,6 @@ if show_shadow:
             )
         )
 
-
 # Layout tweaks
 fig.update_layout(
     template="plotly_white",
@@ -324,29 +325,25 @@ fig.update_layout(
     yaxis=dict(title="Constraint value", rangemode="tozero", range=[0, None])
 )
 
-# ---- hard nonnegative axes ----
-import numpy as np
-
-# make sure X is numeric
+# Hard nonnegative axes
 df[x_col] = pd.to_numeric(df[x_col], errors="coerce")
-
 x_candidates = [df[x_col].max(skipna=True)]
 y_candidates = [pd.to_numeric(df[c], errors="coerce").max(skipna=True) for c in y_select]
 
-if shadow_df is not None and show_shadow:
-    if x_col in shadow_df:
-        x_candidates.append(pd.to_numeric(shadow_df[x_col], errors="coerce").max(skipna=True))
-    for c in [c for c in shadow_df.columns if c != x_col]:
-        y_candidates.append(pd.to_numeric(shadow_df[c], errors="coerce").max(skipna=True))
+if show_shadow:
+    x_candidates.append(pd.to_numeric(shadow_interp[x_col], errors="coerce").max(skipna=True))
+    for c in shadow_cols_select:
+        y_candidates.append(pd.to_numeric(shadow_interp[c], errors="coerce").max(skipna=True))
 
-if 'vertices' in locals() and vertices:
-    _, poly_y = zip(*vertices)
+if old_vertices:
+    _, poly_y = zip(*old_vertices)
     y_candidates.append(np.nanmax(poly_y))
+if new_vertices:
+    _, poly_y2 = zip(*new_vertices)
+    y_candidates.append(np.nanmax(poly_y2))
 
 x_max = np.nanmax(x_candidates)
 y_max = np.nanmax(y_candidates)
-
-# fallback/padding
 x_max = 1.0 if not np.isfinite(x_max) or x_max <= 0 else float(x_max) * 1.05
 y_max = 1.0 if not np.isfinite(y_max) or y_max <= 0 else float(y_max) * 1.05
 
@@ -355,7 +352,6 @@ fig.update_yaxes(autorange=False, range=[0, y_max], zeroline=True)
 
 st.plotly_chart(fig, use_container_width=True)
 
-
 # -----------------------------
 # Tips
 # -----------------------------
@@ -363,7 +359,7 @@ with st.expander("How to structure your Excel"):
     st.markdown(
         """
 - **Main sheet:** one column for X (e.g., `S1`) + one column per constraint (numeric).
-- **Optional `shadows` sheet:** same structure for alternative scenario (costly upgrades, etc.).
+- **Optional `shadows` sheet:** same structure for alternative scenario.
 - **Sense:**  
   - `≤` → Feasible region is between *baseline* and the **minimum** of constraints.  
   - `≥` → Feasible region is between the **maximum** of constraints and *baseline*.
