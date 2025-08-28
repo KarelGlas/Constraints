@@ -188,8 +188,6 @@ if show_shadow and (shadow_df is not None):
                 name=f"{col} (Shadow)",
                 mode='lines',
                 line=dict(width=2, dash='dash'),
-                hoverinfo='text',
-                hovertext=f"{col} increase costs €5,000"
             )
         )
 
