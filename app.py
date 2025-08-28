@@ -50,9 +50,23 @@ if s1_col is None:
     st.stop()
 
 # Coerce and clean S1
+# --- keep all rows (no drop_duplicates) ---
 df[s1_col] = pd.to_numeric(df[s1_col], errors="coerce")
-df = df.dropna(subset=[s1_col]).sort_values(s1_col).drop_duplicates(s1_col)
+df = df.dropna(subset=[s1_col]).sort_values(s1_col)
 df = df.rename(columns={s1_col: "S1"})
+
+def xy_for_interp(col):
+    y = pd.to_numeric(df[col], errors="coerce")
+    g = pd.DataFrame({"S1": df["S1"], "S2": y})
+    # for duplicate S1, take MAX S2 (upper bound curve)
+    g = g.dropna().groupby("S1", as_index=False)["S2"].max().sort_values("S1")
+    return g["S1"].values, g["S2"].values
+
+def interp_from_excel(colname: str, delta: float = 0.0):
+    x, y = xy_for_interp(colname)
+    if len(x) < 2:
+        return np.full_like(S1, np.nan)
+    return np.interp(S1, x, y) + delta
 
 # Constraint columns = all numeric columns except S1
 num_df = df.apply(pd.to_numeric, errors="ignore")
@@ -175,43 +189,43 @@ with colL:
 
     fig = go.Figure()
 
-    if show_heat:
-        z = feasible.astype(int)
-        fig.add_trace(go.Heatmap(
-            x=S1, y=S2_vals, z=z, showscale=False, opacity=0.25,
-            hovertemplate="S1=%{x:.2f}<br>S2=%{y:.2f}<br>Feasible=%{z}<extra></extra>"
-        ))
-
-    # Envelope (draw on top, thicker, dashed)
+    # Interpolated envelope first (dashed, thick)
     fig.add_trace(go.Scatter(
         x=S1, y=envelope, mode="lines", name="Feasible envelope",
         line=dict(width=3, dash="dash"), connectgaps=True
     ))
 
-    # Individual constraints (thick, connect gaps)
-    for i, c in enumerate(constraints):
+    # Raw step-lines per constraint (shows verticals)
+    for c in constraints:
+        y_raw = pd.to_numeric(df[c], errors="coerce")
         fig.add_trace(go.Scatter(
-            x=S1, y=curves[i],
-            mode="lines", name=f"{c} (lvl {st.session_state.levels.get(c,0)})",
-            line=dict(width=2.5),
-            connectgaps=True,
-            hovertemplate=f"{c}: S2_max=%{{y:.2f}}"
+            x=df["S1"], y=y_raw,
+            mode="lines+markers",
+            line=dict(width=2),
+            name=f"{c} (raw)",
+            connectgaps=False,
+            line_shape="hv",          # horizontal–vertical steps (shows vertical jumps)
+            hovertemplate=f"{c}: S2=%{{y:.2f}}<extra></extra>"
         ))
 
+    # Nice margins + labels not clipped
+    # y-range from actual curves (not heatmap)
+    y_all = np.concatenate([np.nanmin(curves, axis=0), np.nanmax(curves, axis=0)])
+    ymin = np.nanmin(y_all); ymax = np.nanmax(y_all)
+    pad = 0.05 * max(1.0, ymax - ymin)
     fig.update_layout(
         height=650,
-        margin=dict(l=90, r=30, t=30, b=80),
+        margin=dict(l=110, r=40, t=30, b=95),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         hovermode="x unified",
-        xaxis=dict(title="Stream 1 (S1)", automargin=True, title_standoff=12),
-        yaxis=dict(title="Stream 2 (S2)", automargin=True, title_standoff=12, range=[y_min_viz, y_max_viz])
+        xaxis=dict(title="FeCl2 (FIC7021)", automargin=True, title_standoff=12),
+        yaxis=dict(title="FeOx (FIC7321)", automargin=True, title_standoff=12,
+                   range=[float(ymin - pad), float(ymax + pad)]),
     )
+    fig.update_traces(cliponaxis=False)
+    clicked = plotly_events(fig, click_event=True, hover_event=False, select_event=False,
+                            override_height=650, override_width="100%")
 
-    clicked = plotly_events(
-        fig,
-        click_event=True, hover_event=False, select_event=False,
-        override_height=650, override_width="100%"
-    )
 
 
 # Click → pick constraint
