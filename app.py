@@ -2,8 +2,8 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-st.set_page_config(page_title="Excel 2D Plot", layout="wide")
-st.title("2D Plot from Excel (thick lines, Plotly)")
+st.set_page_config(page_title="Constraint Plot", layout="wide")
+st.title("Constraint plot")
 
 # --- Sidebar ---
 st.sidebar.header("Excel")
