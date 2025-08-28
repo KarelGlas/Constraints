@@ -217,28 +217,39 @@ if have_shapely and old_vertices and new_vertices:
 
         # Plot delta (may be MultiPolygon)
         geoms = list(delta.geoms) if delta.geom_type == "MultiPolygon" else [delta]
-        for g in geoms:
+        for g in geoms:for g in geoms:
             if g.is_empty:
                 continue
-            x, y = g.exterior.xy
-            custom_out = (np.array(x) + np.array(y)).tolist()  # X+Y for hover
+
+            # exterior
+            x_arr, y_arr = g.exterior.xy          # array('d')
+            x = np.asarray(x_arr)                 # -> np.ndarray
+            y = np.asarray(y_arr)
+
+            # optional: handle holes (interiors)
+            # for ring in g.interiors: ... (same conversion)  # if you plan to plot them
+
+            custom_out = (x + y).tolist()         # keep numeric for hover
+
             fig.add_trace(
                 go.Scatter(
-                    x=x, y=y,
+                    x=x.tolist(),                 # <- lists or np.ndarray work
+                    y=y.tolist(),
                     fill='toself',
-                    fillcolor='rgba(250,150,150,0.35)',  # red-ish delta
+                    fillcolor='rgba(250,150,150,0.35)',
                     line=dict(color='red', width=1, dash='dot'),
                     name="Added Feasible Area",
                     customdata=custom_out,
                     hovertemplate=(
                         "Added feasible area<br>"
                         + f"{x_col}=%{{x}}<br>"
-                          "Constraint=%{y}<br>"
-                          "Output (X+Y)=%{customdata}<br>"
+                        "Constraint=%{y}<br>"
+                        "Output (X+Y)=%{customdata}<br>"
                         "<extra></extra>"
                     ),
                 )
             )
+
 
         # also outline new total feasible region (optional)
         nx, ny = zip(*new_vertices)
