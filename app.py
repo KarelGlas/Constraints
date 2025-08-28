@@ -1,4 +1,3 @@
-import json
 import io
 import numpy as np
 import pandas as pd
@@ -8,314 +7,261 @@ from streamlit_plotly_events import plotly_events
 
 st.set_page_config(page_title="2D Capacity Map", layout="wide")
 
-# ---------- Defaults ----------
-DEFAULT_JSON = {
-    "title": "Production Capacity Map",
-    "s1_min": 0, "s1_max": 100, "s1_step": 1,
-    "s2_min": 0, "s2_max": 100,
-    "bounds": {"s1_max": 100, "s2_max": 100},           # hard caps (optional)
-    "constraints": [
-        {
-            "name": "C_LIN",
-            "type": "excel_column",                      # or "linear" / "quadratic"
-            "expr": None,                                # for formula types
-            "shadows": [                                 # incremental relax levels (ΔS2 allowed) with cost
-                {"delta": 3.0, "cost": 1000},
-                {"delta": 4.0, "cost": 1500},
-                {"delta": 6.0, "cost": 2500}
-            ]
-        },
-        {
-            "name": "C_QUAD",
-            "type": "excel_column",
-            "expr": None,
-            "shadows": [
-                {"delta": 2.0, "cost": 900},
-                {"delta": 3.0, "cost": 1400},
-                {"delta": 5.0, "cost": 2200}
-            ]
-        }
-    ],
-    "click_tolerance": 0.02,                             # fraction of S2 range to treat as “binding”
-    "grid_density": 101
-}
-
-# ---------- Sidebar inputs ----------
-st.sidebar.header("Config (JSON)")
-config_text = st.sidebar.text_area(
-    "Edit JSON config",
-    value=json.dumps(DEFAULT_JSON, indent=2),
-    height=420
+# ---------------- Sidebar: Excel + basic controls ----------------
+st.sidebar.header("Excel")
+excel_file = st.sidebar.file_uploader(
+    "Upload Excel (sheet with S1 + constraint columns; optional sheet 'shadows')",
+    type=["xlsx", "xls"]
 )
 
-# Upload Excel data
-st.sidebar.header("Excel constraints")
-excel_file = st.sidebar.file_uploader("Upload Excel (S1 + constraint columns)", type=["xlsx", "xls"])
+st.sidebar.header("Display / Logic")
+click_tol_frac = st.sidebar.slider("Click tolerance (fraction of S2 range)", 0.0, 0.2, 0.02, 0.005)
+grid_density = st.sidebar.number_input("Grid density (S1 & S2)", min_value=51, max_value=1001, value=201, step=50)
+apply_s2_cap = st.sidebar.checkbox("Apply S2 hard cap from sidebar", value=False)
+s2_cap_value = st.sidebar.number_input("S2 hard cap value (if enabled)", value=100.0)
+show_heat = st.sidebar.checkbox("Show feasibility heat", value=True)
 
-# Session state: shadow levels per constraint
-if "levels" not in st.session_state:
-    st.session_state.levels = {}  # {name: level_index}
+# ---------------- Helpers ----------------
+def norm(s: str) -> str:
+    return "".join(ch for ch in str(s).strip().lower().replace("-", "_").replace(" ", "_") if ch.isalnum() or ch == "_")
 
-# Parse config
-def parse_config(text):
-    try:
-        cfg = json.loads(text)
-        return cfg, None
-    except Exception as e:
-        return None, f"JSON error: {e}"
-
-cfg, cfg_err = parse_config(config_text)
-if cfg_err:
-    st.error(cfg_err)
+# ---------------- Load Excel ----------------
+if not excel_file:
+    st.warning("Upload Excel to proceed. See template below.")
     st.stop()
 
-# Ensure levels keys exist
-for c in cfg["constraints"]:
-    st.session_state.levels.setdefault(c["name"], 0)
+# Try reading main data sheet: pick first sheet
+xls = pd.ExcelFile(excel_file)
+main_sheet = xls.sheet_names[0]
+df = pd.read_excel(xls, sheet_name=main_sheet)
 
-colL, colR = st.columns([0.62, 0.38])
+# Normalize column names for matching but keep originals
+df.columns = [c if isinstance(c, str) else str(c) for c in df.columns]
+cols_norm = {norm(c): c for c in df.columns}
 
+# Find S1 column
+s1_col = None
+for key in ("s1", "stream1", "x", "stream_1"):
+    if key in cols_norm:
+        s1_col = cols_norm[key]
+        break
+if s1_col is None:
+    st.error("Missing S1 column. Accepted headers: S1 / Stream1 / X / Stream_1")
+    st.stop()
 
-# Validate Excel format
-# ---------- Load & validate Excel with robust name matching ----------
-def norm(s: str) -> str:
-    return "".join(ch for ch in str(s).strip().lower().replace("-", "_").replace(" ", "_") if ch.isalnum() or ch=="_")
+# Coerce and clean S1
+df[s1_col] = pd.to_numeric(df[s1_col], errors="coerce")
+df = df.dropna(subset=[s1_col]).sort_values(s1_col).drop_duplicates(s1_col)
+df = df.rename(columns={s1_col: "S1"})
 
-excel_df = None
-excel_map = {}   # maps JSON constraint name -> actual Excel column
+# Constraint columns = all numeric columns except S1
+num_df = df.apply(pd.to_numeric, errors="ignore")
+candidate_cols = [c for c in num_df.columns if c != "S1"]
+# Keep only columns that are numeric or coercible
+constraints = []
+for c in candidate_cols:
+    col = pd.to_numeric(num_df[c], errors="coerce")
+    if col.notna().sum() >= 2:
+        constraints.append(c)
 
-if excel_file:
-    excel_df = pd.read_excel(excel_file)
-    # normalize column index
-    excel_df.columns = [c if isinstance(c, str) else str(c) for c in excel_df.columns]
-    excel_cols_norm = {norm(c): c for c in excel_df.columns}
-    # require S1 (any case/spacing)
-    s1_key = None
-    for k,v in excel_cols_norm.items():
-        if k in ("s1","stream1","x","stream_1"):
-            s1_key = v; break
-    if not s1_key:
-        st.error("Excel must contain column for S1 (accepted headers: S1 / Stream1 / X / Stream_1).")
-        st.stop()
-    # coerce S1
-    excel_df[s1_key] = pd.to_numeric(excel_df[s1_key], errors="coerce")
-    excel_df = excel_df.dropna(subset=[s1_key]).sort_values(s1_key).drop_duplicates(s1_key)
-    excel_df = excel_df.rename(columns={s1_key: "S1"})
+if not constraints:
+    st.error("No constraint columns detected. Add one or more numeric columns besides S1.")
+    st.stop()
 
-    # build mapping for constraints of type 'excel_column'
-    missing = []
-    for c in cfg["constraints"]:
-        if c.get("type","excel_column") != "excel_column":
-            continue
-        want = c["name"]
-        want_norm = norm(want)
-        if want_norm in excel_cols_norm:
-            excel_map[want] = excel_cols_norm[want_norm]
-        else:
-            # heuristic suggestions: contains or startswith
-            candidates = [col for nk,col in excel_cols_norm.items() if want_norm in nk or nk in want_norm or nk.startswith(want_norm[:4])]
-            if candidates:
-                excel_map[want] = candidates[0]  # best guess
-                st.warning(f"Mapping '{want}' → '{candidates[0]}' (auto). Verify header names.")
-            else:
-                excel_map[want] = None
-                missing.append(want)
-
-    if missing:
-        st.error(f"Missing constraint columns in Excel: {missing}. "
-                 "Rename headers to match JSON names or adjust JSON.")
+# Optional: shadows sheet
+shadow_map = {}  # name -> list of dicts [{delta, cost}, ...]
+if "shadows" in [s.lower() for s in xls.sheet_names]:
+    sheet_name = [s for s in xls.sheet_names if s.lower() == "shadows"][0]
+    sh = pd.read_excel(xls, sheet_name=sheet_name)
+    expected = {"constraint", "delta", "cost"}
+    if expected.issubset({norm(c) for c in sh.columns}):
+        # normalize access
+        colmap = {norm(c): c for c in sh.columns}
+        sh = sh.rename(columns={colmap["constraint"]: "constraint",
+                                colmap["delta"]: "delta",
+                                colmap["cost"]: "cost"})
+        sh["constraint"] = sh["constraint"].astype(str)
+        sh["delta"] = pd.to_numeric(sh["delta"], errors="coerce")
+        sh["cost"] = pd.to_numeric(sh["cost"], errors="coerce")
+        sh = sh.dropna(subset=["constraint", "delta", "cost"])
+        # Keep order as given (level 1..n)
+        for name, grp in sh.groupby("constraint", sort=False):
+            shadow_map[name] = [{"delta": float(r["delta"]), "cost": float(r["cost"])} for _, r in grp.iterrows()]
+    else:
+        st.warning("Sheet 'shadows' present but missing required columns: constraint, delta, cost. Ignoring.")
 else:
-    # fallback synthetic to keep app usable
-    excel_s1 = np.arange(cfg["s1_min"], cfg["s1_max"] + cfg["s1_step"], cfg["s1_step"])
-    excel_df = pd.DataFrame({"S1": excel_s1})
-    for c in cfg["constraints"]:
-        if c.get("type","excel_column")=="excel_column":
-            excel_df[c["name"]] = np.maximum(cfg["s2_max"] - 0.5*(excel_s1 - cfg["s1_min"]), 0.0)
-            excel_map[c["name"]] = c["name"]
+    # No shadows sheet -> empty ladders
+    shadow_map = {c: [] for c in constraints}
 
-# helper: interpolator using mapped column
-def interp_from_excel(colname, delta=0.0):
-    mapped = excel_map.get(colname)
-    if mapped is None or mapped not in excel_df.columns:
-        return np.full_like(S1, np.nan)
-    x = excel_df["S1"].values
-    y = pd.to_numeric(excel_df[mapped], errors="coerce").values
-    y = np.nan_to_num(y, nan=np.nanmedian(y) if np.isfinite(np.nanmedian(y)) else 0.0)
+# Ensure every constraint has an entry
+for c in constraints:
+    shadow_map.setdefault(c, [])
+
+# ---------------- State: current levels ----------------
+if "levels" not in st.session_state:
+    st.session_state.levels = {c: 0 for c in constraints}
+else:
+    # sanitize (new uploads)
+    for c in constraints:
+        st.session_state.levels.setdefault(c, 0)
+    # drop levels for removed constraints
+    for k in list(st.session_state.levels.keys()):
+        if k not in constraints:
+            st.session_state.levels.pop(k, None)
+
+# ---------------- Build grids ----------------
+S1_raw = df["S1"].values
+S1_min, S1_max = float(np.min(S1_raw)), float(np.max(S1_raw))
+S1 = np.linspace(S1_min, S1_max, int(grid_density))
+# S2 range inferred from data
+all_vals = []
+for c in constraints:
+    all_vals.append(pd.to_numeric(df[c], errors="coerce").values)
+all_vals = np.concatenate([v[np.isfinite(v)] for v in all_vals]) if all_vals else np.array([0.0, 1.0])
+S2_min, S2_max = float(np.nanmin(all_vals)), float(np.nanmax(all_vals))
+if apply_s2_cap:
+    s2_cap = float(s2_cap_value)
+else:
+    s2_cap = None
+
+# Interpolator from Excel
+def interp_from_excel(colname: str, delta: float = 0.0):
+    x = df["S1"].values
+    y = pd.to_numeric(df[colname], errors="coerce").values
+    # fallback replace nans with median
+    med = np.nanmedian(y) if np.isfinite(np.nanmedian(y)) else 0.0
+    y = np.nan_to_num(y, nan=med)
     return np.interp(S1, x, y) + delta
 
-# Build S1 grid for evaluating constraints and area
-S1 = np.linspace(cfg["s1_min"], cfg["s1_max"], cfg.get("grid_density", 101))
-S2_min, S2_max = cfg["s2_min"], cfg["s2_max"]
+# Constraint curve at current level
+def constraint_curve(name: str):
+    lvl = int(st.session_state.levels.get(name, 0))
+    ladder = shadow_map.get(name, [])
+    add = sum((ladder[i]["delta"] for i in range(min(lvl, len(ladder)))), start=0.0)
+    return interp_from_excel(name, add)
 
-# Interpolator for piecewise columns
-def interp_from_excel(colname, delta=0.0):
-    y = excel_df[colname].values if colname in excel_df.columns else np.full_like(excel_s1, np.nan, dtype=float)
-    return np.interp(S1, excel_s1, np.nan_to_num(y, nan=0.0)) + delta
-
-# Evaluate constraint envelopes at current shadow levels
-def constraint_curve(c):
-    name = c["name"]
-    lvl = st.session_state.levels.get(name, 0)
-    add = 0.0
-    if lvl > 0 and "shadows" in c and len(c["shadows"]) >= lvl:
-        add = sum(sh["delta"] for sh in c["shadows"][:lvl])
-
-    t = c.get("type", "excel_column")
-    if t == "excel_column":
-        return interp_from_excel(name, add)
-    elif t == "linear":
-        # expr example: "a + b*S1"  with {"a": 90, "b": -0.5}
-        p = c.get("expr", {"a": 90.0, "b": -0.5})
-        return p["a"] + p["b"]*S1 + add
-    elif t == "quadratic":
-        # expr example: "a + b*(S1-c)^2" with {"a": 90, "b": -0.02, "c": 30}
-        p = c.get("expr", {"a": 90.0, "b": -0.02, "c": 30.0})
-        return p["a"] + p["b"]*(S1 - p["c"])**2 + add
-    else:
-        return np.full_like(S1, np.nan)
-
-# Compute active envelope and binding index
+# Evaluate all curves
 curves = []
-names = []
-for c in cfg["constraints"]:
-    if c.get("type","excel_column")=="excel_column" and (excel_df is None or c["name"] not in excel_df.columns):
-        continue  # skip absent column
+for c in constraints:
     curves.append(constraint_curve(c))
-    names.append(c["name"])
-if len(curves)==0:
-    st.error("No valid constraints available. Check Excel column names and JSON.")
-    st.stop()
-curves = np.vstack(curves)
+curves = np.vstack(curves)  # shape [n_constraints, len(S1)]
 
-# Apply hard bounds on S2 if given
-s2_cap = cfg.get("bounds", {}).get("s2_max", S2_max)
-envelope = np.minimum(np.nanmin(curves, axis=0), s2_cap)
+# Envelope (min of curves, optionally cap)
+envelope = np.nanmin(curves, axis=0)
+if s2_cap is not None:
+    envelope = np.minimum(envelope, s2_cap)
 
-# Feasible mask on grid (dense)
-nS1 = len(S1)
-nS2 = int(cfg.get("grid_density", 101))
+# Feasible grid
+nS2 = int(grid_density)
 S2_vals = np.linspace(S2_min, S2_max, nS2)
 S1_mesh, S2_mesh = np.meshgrid(S1, S2_vals, indexing="xy")
 envelope_mesh = np.tile(envelope, (nS2, 1))
 feasible = S2_mesh <= envelope_mesh
 
-# Binding constraint at each S1 (index into names)
+# Binding index per S1
 binding_idx = np.nanargmin(curves, axis=0)
 
-# Area estimation (Riemann sum)
-dx = (S1.max() - S1.min()) / (nS1 - 1) if nS1 > 1 else 0.0
-area_feasible = np.trapz(np.clip(envelope, S2_min, S2_max), S1)
-area_feasible = float(max(area_feasible, 0.0))
+# Area (trapz of clipped envelope)
+area_feasible = float(np.trapz(np.clip(envelope, S2_min, S2_max), S1))
+area_feasible = max(area_feasible, 0.0)
 
-# Plot
+# ---------------- Plot ----------------
+colL, colR = st.columns([0.62, 0.38])
 with colL:
-    st.markdown(f"### {cfg.get('title','Capacity Map')}")
-    # Color grid by feasibility & binding constraint (simple 2-color: feasible/infeasible)
-    z = feasible.astype(int)  # 1 feasible, 0 infeasible
-
+    st.markdown("### Production Capacity Map (Excel-driven)")
     fig = go.Figure()
-
-    fig.add_trace(go.Heatmap(
-        x=S1, y=S2_vals, z=z, showscale=False, opacity=0.25,
-        hovertemplate="S1=%{x:.2f}<br>S2=%{y:.2f}<br>Feasible=%{z}<extra></extra>"
-    ))
-
-    # Envelope line
+    if show_heat:
+        z = feasible.astype(int)
+        fig.add_trace(go.Heatmap(
+            x=S1, y=S2_vals, z=z, showscale=False, opacity=0.25,
+            hovertemplate="S1=%{x:.2f}<br>S2=%{y:.2f}<br>Feasible=%{z}<extra></extra>"
+        ))
+    # Envelope
     fig.add_trace(go.Scatter(
         x=S1, y=np.clip(envelope, S2_min, S2_max), mode="lines",
         name="Feasible envelope"
     ))
-
     # Individual constraints
-    for i, c in enumerate(cfg["constraints"]):
+    for i, c in enumerate(constraints):
         fig.add_trace(go.Scatter(
             x=S1, y=np.clip(curves[i], S2_min, S2_max),
-            mode="lines", name=f"{c['name']} (lvl {st.session_state.levels.get(c['name'],0)})",
-            hovertemplate=f"{c['name']}: S2_max=%{{y:.2f}}"
+            mode="lines", name=f"{c} (lvl {st.session_state.levels.get(c,0)})",
+            hovertemplate=f"{c}: S2_max=%{{y:.2f}}"
         ))
-
     fig.update_layout(
         xaxis_title="Stream 1 (S1)",
         yaxis_title="Stream 2 (S2)",
         margin=dict(l=10, r=10, t=10, b=10),
         height=650
     )
+    clicked = plotly_events(fig, click_event=True, hover_event=False, select_event=False,
+                            override_height=650, override_width="100%")
 
-    clicked = plotly_events(fig, click_event=True, hover_event=False, select_event=False, override_height=650, override_width="100%")
-
-# Determine clicked patch → which constraint to relax?
+# Click → pick constraint
 def identify_clicked_constraint(pt):
     if not pt:
         return None
-    x = pt[0].get("x")
-    y = pt[0].get("y")
+    x = pt[0].get("x"); y = pt[0].get("y")
     if x is None or y is None:
         return None
-    # Find nearest S1 index
-    idx = int(np.clip(np.searchsorted(S1, x), 1, len(S1)-1))
-    # If infeasible point: find first violating (lowest envelope) constraint
-    # Else: if close to envelope, take binding constraint; otherwise pick binding at that S1
+    idx = int(np.clip(np.searchsorted(S1, x), 1, len(S1) - 1))
     env = envelope[idx]
-    tol = cfg.get("click_tolerance", 0.02) * (S2_max - S2_min)
+    tol = click_tol_frac * (S2_max - S2_min)
     if y > env + tol:
-        # infeasible → bottleneck is the constraint that defines envelope
         bid = binding_idx[idx]
     else:
-        # near/under envelope → choose the binding constraint (closest)
-        diffs = curves[:, idx] - y
-        diffs = np.where(np.isnan(diffs), np.inf, np.abs(diffs))
+        diffs = np.abs(curves[:, idx] - y)
+        diffs = np.where(np.isnan(diffs), np.inf, diffs)
         bid = int(np.nanargmin(diffs))
-    return names[bid]
+    return constraints[bid]
 
 chosen = identify_clicked_constraint(clicked)
 
 with colR:
     st.markdown("### Controls")
-    st.write(f"**Feasible area (approx.):** {area_feasible:,.1f} (S1·S2 units)")
+    st.write(f"**Feasible area (approx.):** {area_feasible:,.1f} (S1·S2)")
 
     if chosen:
-        st.success(f"Selected region ≈ constraint: **{chosen}**")
+        st.success(f"Selected ≈ **{chosen}**")
 
-    # Show shadow ladder + next cost
+    # Next shadow info + Δarea estimate
     def next_shadow_info(name):
-        c = next((x for x in cfg["constraints"] if x["name"] == name), None)
-        if not c:
-            return None
-        lvl = st.session_state.levels.get(name, 0)
-        ladder = c.get("shadows", [])
+        ladder = shadow_map.get(name, [])
+        lvl = int(st.session_state.levels.get(name, 0))
         if lvl >= len(ladder):
             return {"status": "maxed"}
         nxt = ladder[lvl]
-        return {"status": "ok", "next_delta": nxt["delta"], "next_cost": nxt["cost"], "level_after": lvl + 1}
+        return {"status": "ok", "next_delta": nxt["delta"], "next_cost": nxt["cost"], "next_level": lvl + 1}
 
     if chosen:
         info = next_shadow_info(chosen)
         if info and info["status"] == "ok":
-            # Rough Δarea estimate: integrate min(new envelope, cap) - old envelope (clipped >=0)
-            # Recompute chosen constraint with +delta
-            cdef = next(c for c in cfg["constraints"] if c["name"] == chosen)
-            lvl_tmp = st.session_state.levels[chosen]
-            st.session_state.levels[chosen] = lvl_tmp + 1
-            # recompute
+            # Temporarily increment chosen level to estimate Δarea
+            lvl0 = st.session_state.levels[chosen]
+            st.session_state.levels[chosen] = lvl0 + 1
+            # recompute curves & envelope
             curves_new = []
-            for c in cfg["constraints"]:
+            for c in constraints:
                 curves_new.append(constraint_curve(c))
             curves_new = np.vstack(curves_new)
-            env_new = np.minimum(np.nanmin(curves_new, axis=0), cfg.get("bounds", {}).get("s2_max", S2_max))
-            dA = np.trapz(np.clip(env_new, S2_min, S2_max) - np.clip(envelope, S2_min, S2_max), S1)
-            dA = float(max(dA, 0.0))
+            env_new = np.nanmin(curves_new, axis=0)
+            if s2_cap is not None:
+                env_new = np.minimum(env_new, s2_cap)
+            dA = float(np.trapz(np.clip(env_new, S2_min, S2_max) - np.clip(envelope, S2_min, S2_max), S1))
+            dA = max(dA, 0.0)
             # revert
-            st.session_state.levels[chosen] = lvl_tmp
+            st.session_state.levels[chosen] = lvl0
 
-            st.info(f"Next relax for **{chosen}** → +ΔS2={info['next_delta']} at cost={info['next_cost']}.  \nEstimated **Δarea ≈ {dA:,.1f}**")
+            st.info(f"Next relax **{chosen}** → ΔS2={info['next_delta']} @ cost={info['next_cost']}.  "
+                    f"Estimated **Δarea ≈ {dA:,.1f}**")
 
     colA, colB, colC = st.columns(3)
     with colA:
         if st.button("Apply relax", use_container_width=True, type="primary", disabled=(chosen is None)):
             if chosen:
-                c = next((x for x in cfg["constraints"] if x["name"] == chosen), None)
-                lvl = st.session_state.levels.get(chosen, 0)
-                if c and lvl < len(c.get("shadows", [])):
+                ladder = shadow_map.get(chosen, [])
+                lvl = int(st.session_state.levels.get(chosen, 0))
+                if lvl < len(ladder):
                     st.session_state.levels[chosen] = lvl + 1
                     st.experimental_rerun()
     with colB:
@@ -327,16 +273,31 @@ with colR:
         if st.button("Recompute", use_container_width=True):
             st.experimental_rerun()
 
-    # Show current levels table & costs sunk
+    # Levels & spent cost
     rows = []
     total_cost = 0.0
-    for c in cfg["constraints"]:
-        name = c["name"]
-        lvl = st.session_state.levels.get(name, 0)
-        cost = 0.0
-        for i in range(lvl):
-            cost += c.get("shadows", [])[i]["cost"]
-        total_cost += cost
-        rows.append({"constraint": name, "level": lvl, "cost_spent": cost})
+    for c in constraints:
+        lvl = int(st.session_state.levels.get(c, 0))
+        ladder = shadow_map.get(c, [])
+        spent = sum((ladder[i]["cost"] for i in range(min(lvl, len(ladder)))), start=0.0)
+        total_cost += spent
+        rows.append({"constraint": c, "level": lvl, "cost_spent": spent})
     st.dataframe(pd.DataFrame(rows))
     st.write(f"**Total cost spent:** {total_cost:,.0f}")
+
+# ---------------- Template hint ----------------
+with st.expander("Excel template (structure)"):
+    st.markdown("""
+**Main sheet (first sheet, any name):**
+- Column **S1** (monotonic or sortable numeric).
+- One column per constraint: **C_LIN**, **C_QUAD**, **...** (numeric S2 maxima vs S1).
+
+**Optional `shadows` sheet:**
+- Columns: **constraint, delta, cost**.
+- One row per level, ordered top-to-bottom = level 1..n.
+- `constraint` must exactly match a column name from main sheet.
+
+**Notes:**
+- S2 range inferred from data; optional hard cap via sidebar.
+- No JSON needed; constraints = Excel columns.
+""")
