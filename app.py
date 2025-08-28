@@ -237,7 +237,6 @@ if have_shapely and old_vertices and new_vertices:
                     y=y.tolist(),
                     fill='toself',
                     fillcolor='rgba(250,150,150,0.35)',
-                    line=dict(color='red', width=1, dash='dot'),
                     name="Added Feasible Area",
                     customdata=custom_out,
                     hovertemplate=(
