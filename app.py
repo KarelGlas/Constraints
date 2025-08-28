@@ -240,11 +240,8 @@ if have_shapely and old_vertices and new_vertices:
                     name="Added Feasible Area",
                     customdata=custom_out,
                     hovertemplate=(
-                        "Added feasible area<br>"
                         + f"{x_col}=%{{x}}<br>"
-                        "Constraint=%{y}<br>"
                         "Output (X+Y)=%{customdata}<br>"
-                        "<extra></extra>"
                     ),
                 )
             )
