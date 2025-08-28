@@ -318,3 +318,8 @@ with st.expander("Excel template (structure)"):
 - S2 range inferred from data; optional hard cap via sidebar.
 - No JSON needed; constraints = Excel columns.
 """)
+with st.expander("Debug"):
+    st.write("Constraints:", constraints)
+    st.write("S1 range:", float(S1.min()), float(S1.max()))
+    st.write("Y range (viz):", y_min_viz, y_max_viz)
+    st.write("First curve sample:", {c: float(curves[i][len(S1)//2]) for i, c in enumerate(constraints)})
