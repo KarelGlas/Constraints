@@ -185,8 +185,8 @@ fig.update_layout(
     hovermode="closest",
     legend_title_text="",
     margin=dict(l=20, r=20, t=40, b=10),
-    xaxis_title=str(x_col),
-    yaxis_title="Constraint value"
+    xaxis=dict(title=str(x_col), rangemode="tozero", range=[0, None]),
+    yaxis=dict(title="Constraint value", rangemode="tozero", range=[0, None])
 )
 
 st.plotly_chart(fig, use_container_width=True)
