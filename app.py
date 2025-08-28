@@ -1,24 +1,19 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
 import numpy as np
+import plotly.express as px
+from streamlit_plotly_events import plotly_events
 
-
-st.set_page_config(page_title="Constraint Plot", layout="wide")
+st.set_page_config(page_title="Constraint plot", layout="wide")
 st.title("Constraint plot")
 
-# --- Sidebar ---
+# ---- Sidebar: data upload ----
 st.sidebar.header("Excel")
-uploaded = st.sidebar.file_uploader(
-    "Upload Excel (sheet with S1 + constraint columns; optional sheet 'shadows')",
-    type=["xlsx", "xls"]
-)
-
+uploaded = st.sidebar.file_uploader("Upload Excel", type=["xlsx", "xls"])
 if not uploaded:
     st.info("Upload an Excel file in the sidebar to begin.")
     st.stop()
 
-# List sheets
 xlsx = pd.ExcelFile(uploaded)
 sheet = st.sidebar.selectbox("Select sheet", xlsx.sheet_names)
 
@@ -26,75 +21,93 @@ sheet = st.sidebar.selectbox("Select sheet", xlsx.sheet_names)
 def load_df(file, sheet_name):
     df = pd.read_excel(file, sheet_name=sheet_name)
     if "S1" in df.columns:
-        x_col = "S1"
+        xcol = "S1"
     else:
-        x_col = df.columns[0]
-    return df, x_col
+        xcol = df.columns[0]
+    return df, xcol
 
-df, default_x = load_df(uploaded, sheet)
+df, xcol = load_df(uploaded, sheet)
 
-
-# --- Axis selections in sidebar ---
+# ---- Column selection ----
 numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-x_col = st.sidebar.selectbox(
-    "X axis", 
-    options=numeric_cols + [c for c in df.columns if c not in numeric_cols], 
-    index=(numeric_cols.index(default_x) if default_x in numeric_cols else 0)
-)
-y_candidates = [c for c in numeric_cols if c != x_col]
-y_cols = st.sidebar.multiselect("Y series", y_candidates, default=y_candidates)
+ycols = st.sidebar.multiselect("Series to show", [c for c in numeric_cols if c != xcol],
+                               default=[c for c in numeric_cols if c != xcol])
 
-if not y_cols:
+if not ycols:
     st.warning("Select at least one Y series in the sidebar.")
     st.stop()
 
-# Melt for Plotly
-plot_df = df[[x_col] + y_cols].copy()
-long_df = plot_df.melt(id_vars=x_col, value_vars=y_cols, var_name="Series", value_name="Value")
+# ---- Classify constraint types ----
+st.sidebar.markdown("**Constraint types**")
+upper_set = st.sidebar.multiselect("Upper (≤)", ycols,
+                                   default=[c for c in ycols if df[c].diff().mean() <= 0])
+lower_set = st.sidebar.multiselect("Lower (≥)", [c for c in ycols if c not in upper_set],
+                                   default=[c for c in ycols if df[c].diff().mean() > 0])
 
-# --- controls in sidebar ---
-upper_series = st.sidebar.selectbox("Upper bound series", y_candidates, index=0, key="upper")
-lower_series = st.sidebar.selectbox("Lower bound series", [c for c in y_candidates if c != upper_series], index=0, key="lower")
-shade_on = st.sidebar.checkbox("Highlight area between bounds", value=True)
+# ---- Base long df & plot ----
+plot_df = df[[xcol] + ycols].copy()
+long_df = plot_df.melt(id_vars=xcol, var_name="Series", value_name="Value")
 
-# --- long format (kept) ---
-plot_df = df[[x_col] + y_cols].copy()
-long_df = plot_df.melt(id_vars=x_col, value_vars=y_cols, var_name="Series", value_name="Value")
+fig = px.line(long_df, x=xcol, y="Value", color="Series")
+fig.update_traces(line=dict(width=4))  # thick lines
 
-# --- base lines ---
-fig = px.line(long_df, x=x_col, y="Value", color="Series", markers=False)
-fig.update_traces(line=dict(width=4))
-
-# --- hard limits start at 0 ---
-xmax = max(0, float(long_df[x_col].max()))
-ymax = max(0, float(long_df["Value"].max()))
+xmax = float(long_df[xcol].max())
+ymax = float(long_df["Value"].max())
 fig.update_layout(
     template="plotly_white",
     hovermode="x unified",
-    legend_title_text="",
-    margin=dict(l=10, r=10, t=40, b=10),
-    xaxis=dict(range=[0, xmax]),
-    yaxis=dict(range=[0, ymax])
+    xaxis=dict(range=[0, xmax], title=str(xcol)),
+    yaxis=dict(range=[0, ymax], title="Value"),
+    margin=dict(l=10, r=10, t=40, b=10)
 )
 
-# --- shaded area between two constraints ---
-if shade_on and upper_series in plot_df and lower_series in plot_df:
-    # align on a shared x-grid (union of x's)
-    x = np.sort(plot_df[x_col].unique())
-    u = np.interp(x, plot_df[x_col], plot_df[upper_series])
-    l = np.interp(x, plot_df[x_col], plot_df[lower_series])
+# ---- Interaction: click to pick interval (two clicks) ----
+if "clicks" not in st.session_state:
+    st.session_state.clicks = []
 
-    # ensure correct ordering, clip to axes ≥ 0
-    top = np.maximum(u, l)
-    bot = np.minimum(u, l)
-    top = np.clip(top, 0, None)
-    bot = np.clip(bot, 0, None)
-    x = np.clip(x, 0, None)
+st.caption("Click twice on the chart to select an x-interval. Third click resets.")
+events = plotly_events(fig, click_event=True, select_event=False, hover_event=False)
 
-    # add two invisible lines to create a filled band
-    fig.add_scatter(x=x, y=top, mode="lines", line=dict(width=0), name=f"Upper: {upper_series}",
-                    showlegend=False)
-    fig.add_scatter(x=x, y=bot, mode="lines", line=dict(width=0), name=f"Lower: {lower_series}",
-                    fill="tonexty", fillcolor="rgba(255,0,0,0.20)", showlegend=False)
+if events:
+    x_clicked = events[0]["x"]
+    st.session_state.clicks.append(x_clicked)
+    if len(st.session_state.clicks) > 2:
+        st.session_state.clicks = [x_clicked]  # reset
 
+# ---- Shade feasible band inside selected interval ----
+if len(st.session_state.clicks) == 2:
+    x1, x2 = sorted(st.session_state.clicks)
+
+    # common x grid over interval
+    X = plot_df[xcol].values
+    grid = np.linspace(max(0, X.min(), x1), max(0, x2), 400)
+
+    # interpolate series on grid
+    vals = {c: np.interp(grid, X, plot_df[c].values) for c in ycols}
+
+    # envelopes: upper = min of uppers, lower = max of lowers and 0-axis
+    upper = np.minimum.reduce([vals[c] for c in upper_set]) if upper_set else np.inf*np.ones_like(grid)
+    lowers = [np.zeros_like(grid)]
+    if lower_set:
+        lowers += [vals[c] for c in lower_set]
+    lower = np.maximum.reduce(lowers)
+
+    mask = upper >= lower
+    gx, gtop, gbot = grid[mask], upper[mask], lower[mask]
+
+    if len(gx) > 0:
+        fig.add_scatter(x=gx, y=gtop, mode="lines", line=dict(width=0),
+                        name="Feasible upper", showlegend=False)
+        fig.add_scatter(x=gx, y=gbot, mode="lines", line=dict(width=0),
+                        fill="tonexty", fillcolor="rgba(255,0,0,0.25)",
+                        name="Feasible area", showlegend=True)
+
+# ---- Render ----
 st.plotly_chart(fig, use_container_width=True)
+
+# Reset button
+if st.button("Reset selection"):
+    st.session_state.clicks = []
+
+st.subheader("Data preview")
+st.dataframe(df.head())
