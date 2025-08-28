@@ -98,12 +98,26 @@ sense = st.sidebar.radio("Feasibility sense", options=["≤", "≥"], index=0, h
 baseline = st.sidebar.number_input("Baseline (other bound)", value=0.0, step=1.0, help="Lower bound for ‘≤’, upper bound for ‘≥’.")
 show_bottleneck = st.sidebar.checkbox("Show active bottleneck labels", value=True)
 
-# Shadow scenario
+# Shadow scenario — column selector (replaces binary toggle)
 shadow_df = None
+shadow_cols_select = []
 if any(s.lower() == 'shadows' for s in sheet_names):
-    shadow_df_raw = pd.read_excel(uploaded_file, sheet_name=[s for s in sheet_names if s.lower() == 'shadows'][0])
+    shadow_sheet = [s for s in sheet_names if s.lower() == 'shadows'][0]
+    shadow_df_raw = pd.read_excel(uploaded_file, sheet_name=shadow_sheet)
     shadow_df = sanitize_numeric(shadow_df_raw)
-show_shadow = st.sidebar.checkbox("Show shadow constraints scenario", value=False) if shadow_df is not None else False
+
+    if x_col not in shadow_df.columns:
+        st.sidebar.warning(f"'shadows' sheet missing X column '{x_col}'. No shadows plotted.")
+    else:
+        sh_cols_all = [c for c in shadow_df.columns if c != x_col and pd.api.types.is_numeric_dtype(shadow_df[c])]
+        shadow_cols_select = st.sidebar.multiselect(
+            "Shadow columns to add",
+            options=sh_cols_all,
+            default=[],
+            help="Pick specific shadow constraints to overlay."
+        )
+
+show_shadow = bool(shadow_df is not None and x_col in (shadow_df.columns if shadow_df is not None else []) and len(shadow_cols_select) > 0)
 
 # -----------------------------
 # Build figure
