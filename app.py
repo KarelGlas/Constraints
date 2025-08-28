@@ -189,6 +189,35 @@ fig.update_layout(
     yaxis=dict(title="Constraint value", rangemode="tozero", range=[0, None])
 )
 
+# ---- hard nonnegative axes ----
+import numpy as np
+
+# make sure X is numeric
+df[x_col] = pd.to_numeric(df[x_col], errors="coerce")
+
+x_candidates = [df[x_col].max(skipna=True)]
+y_candidates = [pd.to_numeric(df[c], errors="coerce").max(skipna=True) for c in y_select]
+
+if shadow_df is not None and show_shadow:
+    if x_col in shadow_df:
+        x_candidates.append(pd.to_numeric(shadow_df[x_col], errors="coerce").max(skipna=True))
+    for c in [c for c in shadow_df.columns if c != x_col]:
+        y_candidates.append(pd.to_numeric(shadow_df[c], errors="coerce").max(skipna=True))
+
+if 'vertices' in locals() and vertices:
+    _, poly_y = zip(*vertices)
+    y_candidates.append(np.nanmax(poly_y))
+
+x_max = np.nanmax(x_candidates)
+y_max = np.nanmax(y_candidates)
+
+# fallback/padding
+x_max = 1.0 if not np.isfinite(x_max) or x_max <= 0 else float(x_max) * 1.05
+y_max = 1.0 if not np.isfinite(y_max) or y_max <= 0 else float(y_max) * 1.05
+
+fig.update_xaxes(autorange=False, range=[0, x_max], zeroline=True)
+fig.update_yaxes(autorange=False, range=[0, y_max], zeroline=True)
+
 st.plotly_chart(fig, use_container_width=True)
 
 
