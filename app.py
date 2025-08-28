@@ -241,7 +241,9 @@ if have_shapely and old_vertices and new_vertices:
                     customdata=custom_out,
                     hovertemplate=(
                         + f"{x_col}=%{{x}}<br>"
+                        "Constraint=%{y}<br>"
                         "Output (X+Y)=%{customdata}<br>"
+                        "<extra></extra>"
                     ),
                 )
             )
