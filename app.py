@@ -1,286 +1,297 @@
-"""
-Capacity Envelope Unlock Simulator — Streamlit
-----------------------------------------------
-Single-file Streamlit app to map 2D capacity space (x=Stream1, y=Stream2),
-apply constraints (linear / quadratic / piecewise), and visualize the
-"unlockable" areas when relaxing constraints to their next shadow level with costs.
-
-Run locally
------------
-1) pip install streamlit plotly shapely numpy streamlit-plotly-events
-2) streamlit run app.py
-
-Deploy (Streamlit Community Cloud)
-----------------------------------
-- Put this file as app.py in a Git repo + requirements.txt with the packages above.
-- Deploy from share.streamlit.io.
-"""
-
-from __future__ import annotations
 import json
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Tuple
-
+import io
 import numpy as np
-import streamlit as st
+import pandas as pd
 import plotly.graph_objects as go
-from shapely.geometry import Polygon, box, MultiPolygon
-from shapely.ops import unary_union
+import streamlit as st
 from streamlit_plotly_events import plotly_events
 
-# ------------------------------
-# Geometry helpers
-# ------------------------------
+st.set_page_config(page_title="2D Capacity Map", layout="wide")
 
-def clamp(val, lo, hi):
-    return max(lo, min(hi, val))
+# ---------- Defaults ----------
+DEFAULT_JSON = {
+    "title": "Production Capacity Map",
+    "s1_min": 0, "s1_max": 100, "s1_step": 1,
+    "s2_min": 0, "s2_max": 100,
+    "bounds": {"s1_max": 100, "s2_max": 100},           # hard caps (optional)
+    "constraints": [
+        {
+            "name": "C_LIN",
+            "type": "excel_column",                      # or "linear" / "quadratic"
+            "expr": None,                                # for formula types
+            "shadows": [                                 # incremental relax levels (ΔS2 allowed) with cost
+                {"delta": 3.0, "cost": 1000},
+                {"delta": 4.0, "cost": 1500},
+                {"delta": 6.0, "cost": 2500}
+            ]
+        },
+        {
+            "name": "C_QUAD",
+            "type": "excel_column",
+            "expr": None,
+            "shadows": [
+                {"delta": 2.0, "cost": 900},
+                {"delta": 3.0, "cost": 1400},
+                {"delta": 5.0, "cost": 2200}
+            ]
+        }
+    ],
+    "click_tolerance": 0.02,                             # fraction of S2 range to treat as “binding”
+    "grid_density": 101
+}
 
+# ---------- Sidebar inputs ----------
+st.sidebar.header("Config (JSON)")
+config_text = st.sidebar.text_area(
+    "Edit JSON config",
+    value=json.dumps(DEFAULT_JSON, indent=2),
+    height=420
+)
 
-def polygon_under_function(f, x_min, x_max, y_min, y_max, sense: str = "le", n:int=400) -> Polygon:
-    xs = np.linspace(x_min, x_max, n)
-    ys = np.array([f(x) for x in xs])
-    ys = np.clip(ys, y_min, y_max)
-    if sense == "le":
-        bottom = [(x_min, y_min), (x_max, y_min)]
-        curve = list(zip(xs[::-1], ys[::-1]))
-        coords = bottom + curve
+# Upload Excel data
+st.sidebar.header("Excel constraints")
+excel_file = st.sidebar.file_uploader("Upload Excel (S1 + constraint columns)", type=["xlsx", "xls"])
+
+# Session state: shadow levels per constraint
+if "levels" not in st.session_state:
+    st.session_state.levels = {}  # {name: level_index}
+
+# Parse config
+def parse_config(text):
+    try:
+        cfg = json.loads(text)
+        return cfg, None
+    except Exception as e:
+        return None, f"JSON error: {e}"
+
+cfg, cfg_err = parse_config(config_text)
+if cfg_err:
+    st.error(cfg_err)
+    st.stop()
+
+# Ensure levels keys exist
+for c in cfg["constraints"]:
+    st.session_state.levels.setdefault(c["name"], 0)
+
+colL, colR = st.columns([0.62, 0.38])
+
+# ---------- Load Excel ----------
+excel_df = None
+if excel_file:
+    try:
+        excel_df = pd.read_excel(excel_file)
+    except Exception as e:
+        st.error(f"Excel read error: {e}")
+        st.stop()
+
+# Validate Excel format
+if excel_df is not None:
+    if "S1" not in excel_df.columns:
+        st.error("Excel must have column 'S1'. Other columns = constraints.")
+        st.stop()
+    # sort and drop dups
+    excel_df = excel_df.sort_values("S1").drop_duplicates("S1")
+    excel_s1 = excel_df["S1"].values
+else:
+    # if no Excel, synthesize defaults so the app still runs
+    excel_s1 = np.arange(cfg["s1_min"], cfg["s1_max"] + cfg["s1_step"], cfg["s1_step"])
+    excel_df = pd.DataFrame({"S1": excel_s1})
+    # create placeholders for any excel_column constraints so plotting works
+    for c in cfg["constraints"]:
+        if c["type"] == "excel_column":
+            if c["name"] not in excel_df.columns:
+                # simple fallback profile
+                excel_df[c["name"]] = np.maximum(cfg["s2_max"] - 0.5*(excel_s1 - cfg["s1_min"]), 0.0)
+
+# Build S1 grid for evaluating constraints and area
+S1 = np.linspace(cfg["s1_min"], cfg["s1_max"], cfg.get("grid_density", 101))
+S2_min, S2_max = cfg["s2_min"], cfg["s2_max"]
+
+# Interpolator for piecewise columns
+def interp_from_excel(colname, delta=0.0):
+    y = excel_df[colname].values if colname in excel_df.columns else np.full_like(excel_s1, np.nan, dtype=float)
+    return np.interp(S1, excel_s1, np.nan_to_num(y, nan=0.0)) + delta
+
+# Evaluate constraint envelopes at current shadow levels
+def constraint_curve(c):
+    name = c["name"]
+    lvl = st.session_state.levels.get(name, 0)
+    add = 0.0
+    if lvl > 0 and "shadows" in c and len(c["shadows"]) >= lvl:
+        add = sum(sh["delta"] for sh in c["shadows"][:lvl])
+
+    t = c.get("type", "excel_column")
+    if t == "excel_column":
+        return interp_from_excel(name, add)
+    elif t == "linear":
+        # expr example: "a + b*S1"  with {"a": 90, "b": -0.5}
+        p = c.get("expr", {"a": 90.0, "b": -0.5})
+        return p["a"] + p["b"]*S1 + add
+    elif t == "quadratic":
+        # expr example: "a + b*(S1-c)^2" with {"a": 90, "b": -0.02, "c": 30}
+        p = c.get("expr", {"a": 90.0, "b": -0.02, "c": 30.0})
+        return p["a"] + p["b"]*(S1 - p["c"])**2 + add
     else:
-        top = [(x_min, y_max), (x_max, y_max)]
-        curve = list(zip(xs, ys))
-        coords = curve + top
-    return Polygon(coords).intersection(box(x_min, x_max, y_min, y_max))
+        return np.full_like(S1, np.nan)
 
+# Compute active envelope and binding index
+curves = []
+names = []
+for c in cfg["constraints"]:
+    curves.append(constraint_curve(c))
+    names.append(c["name"])
+curves = np.vstack(curves)  # shape: (n_constraints, len(S1))
 
-def polygon_left_of_vertical(x_cut, x_min, x_max, y_min, y_max, sense: str = "le") -> Polygon:
-    x0 = clamp(x_cut, x_min, x_max)
-    if sense == "le":
-        coords = [(x_min, y_min), (x0, y_min), (x0, y_max), (x_min, y_max)]
+# Apply hard bounds on S2 if given
+s2_cap = cfg.get("bounds", {}).get("s2_max", S2_max)
+envelope = np.minimum(np.nanmin(curves, axis=0), s2_cap)
+
+# Feasible mask on grid (dense)
+nS1 = len(S1)
+nS2 = int(cfg.get("grid_density", 101))
+S2_vals = np.linspace(S2_min, S2_max, nS2)
+S1_mesh, S2_mesh = np.meshgrid(S1, S2_vals, indexing="xy")
+envelope_mesh = np.tile(envelope, (nS2, 1))
+feasible = S2_mesh <= envelope_mesh
+
+# Binding constraint at each S1 (index into names)
+binding_idx = np.nanargmin(curves, axis=0)
+
+# Area estimation (Riemann sum)
+dx = (S1.max() - S1.min()) / (nS1 - 1) if nS1 > 1 else 0.0
+area_feasible = np.trapz(np.clip(envelope, S2_min, S2_max), S1)
+area_feasible = float(max(area_feasible, 0.0))
+
+# Plot
+with colL:
+    st.markdown(f"### {cfg.get('title','Capacity Map')}")
+    # Color grid by feasibility & binding constraint (simple 2-color: feasible/infeasible)
+    z = feasible.astype(int)  # 1 feasible, 0 infeasible
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Heatmap(
+        x=S1, y=S2_vals, z=z, showscale=False, opacity=0.25,
+        hovertemplate="S1=%{x:.2f}<br>S2=%{y:.2f}<br>Feasible=%{z}<extra></extra>"
+    ))
+
+    # Envelope line
+    fig.add_trace(go.Scatter(
+        x=S1, y=np.clip(envelope, S2_min, S2_max), mode="lines",
+        name="Feasible envelope"
+    ))
+
+    # Individual constraints
+    for i, c in enumerate(cfg["constraints"]):
+        fig.add_trace(go.Scatter(
+            x=S1, y=np.clip(curves[i], S2_min, S2_max),
+            mode="lines", name=f"{c['name']} (lvl {st.session_state.levels.get(c['name'],0)})",
+            hovertemplate=f"{c['name']}: S2_max=%{{y:.2f}}"
+        ))
+
+    fig.update_layout(
+        xaxis_title="Stream 1 (S1)",
+        yaxis_title="Stream 2 (S2)",
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=650
+    )
+
+    clicked = plotly_events(fig, click_event=True, hover_event=False, select_event=False, override_height=650, override_width="100%")
+
+# Determine clicked patch → which constraint to relax?
+def identify_clicked_constraint(pt):
+    if not pt:
+        return None
+    x = pt[0].get("x")
+    y = pt[0].get("y")
+    if x is None or y is None:
+        return None
+    # Find nearest S1 index
+    idx = int(np.clip(np.searchsorted(S1, x), 1, len(S1)-1))
+    # If infeasible point: find first violating (lowest envelope) constraint
+    # Else: if close to envelope, take binding constraint; otherwise pick binding at that S1
+    env = envelope[idx]
+    tol = cfg.get("click_tolerance", 0.02) * (S2_max - S2_min)
+    if y > env + tol:
+        # infeasible → bottleneck is the constraint that defines envelope
+        bid = binding_idx[idx]
     else:
-        coords = [(x0, y_min), (x_max, y_min), (x_max, y_max), (x0, y_max)]
-    return Polygon(coords)
+        # near/under envelope → choose the binding constraint (closest)
+        diffs = curves[:, idx] - y
+        diffs = np.where(np.isnan(diffs), np.inf, np.abs(diffs))
+        bid = int(np.nanargmin(diffs))
+    return names[bid]
 
-
-def shapely_to_traces(geom: Polygon | MultiPolygon, name: str, hovertext: str, fillalpha=0.40):
-    traces = []
-    if geom.is_empty:
-        return traces
-    geoms = [geom] if isinstance(geom, Polygon) else list(geom.geoms)
-    for g in geoms:
-        x, y = g.exterior.xy
-        tr = go.Scatter(x=list(x), y=list(y), mode="lines", fill="toself",
-                        name=name, hoverinfo="text", text=hovertext, opacity=fillalpha)
-        traces.append(tr)
-    return traces
-
-
-# ------------------------------
-# Constraint model
-# ------------------------------
-
-@dataclass
-class ShadowStep:
-    delta: float
-    cost: float
-
-@dataclass
-class Constraint:
-    id: str
-    kind: str  # 'linear' | 'quadratic' | 'piecewise'
-    sense: str # 'le' or 'ge'
-    params: Dict[str, Any]
-    shadows: List[ShadowStep] = field(default_factory=list)
-
-    def polygon(self, bounds: Tuple[float,float,float,float], level:int=0, n:int=400) -> Polygon:
-        x_min, x_max, y_min, y_max = bounds
-        delta = 0.0
-        if level > 0 and self.shadows:
-            level = min(level, len(self.shadows))
-            delta = sum(s.delta for s in self.shadows[:level])
-        if self.kind == 'linear':
-            a,b,c = self.params['a'], self.params['b'], self.params['c']
-            c_shift = c + delta
-            if abs(b) < 1e-9:  # vertical
-                x_cut = c_shift / a
-                sense = self.sense
-                if a < 0:
-                    sense = 'ge' if self.sense=='le' else 'le'
-                return polygon_left_of_vertical(x_cut, x_min, x_max, y_min, y_max, sense)
-            def f(x):
-                return (c_shift - a*x)/b
-            sense = self.sense if b>0 else ('ge' if self.sense=='le' else 'le')
-            return polygon_under_function(f, x_min, x_max, y_min, y_max, sense, n)
-        elif self.kind == 'quadratic':
-            a,b,c = self.params['a'], self.params['b'], self.params['c']
-            c_shift = c + delta
-            def f(x):
-                return a*(x**2) + b*x + c_shift
-            return polygon_under_function(f, x_min, x_max, y_min, y_max, self.sense, n)
-        elif self.kind == 'piecewise':
-            pts = self.params['points']
-            xs = np.array([p[0] for p in pts])
-            ys = np.array([p[1] for p in pts]) + delta
-            def f(x):
-                return np.interp(x, xs, ys, left=ys[0], right=ys[-1])
-            x0, x1 = max(x_min, xs.min()), min(x_max, xs.max())
-            return polygon_under_function(f, x0, x1, y_min, y_max, self.sense, n)
-        else:
-            raise ValueError(f"Unknown constraint kind: {self.kind}")
-
-
-def intersect_all(polys: List[Polygon]) -> Polygon:
-    if not polys:
-        return Polygon()
-    region = polys[0]
-    for p in polys[1:]:
-        region = region.intersection(p)
-        if region.is_empty:
-            return region
-    return region
-
-
-def compute_regions(config: Dict[str,Any], levels: Dict[str,int]):
-    bounds = tuple(config['bounds'])
-    cons = [Constraint(
-        id=c['id'], kind=c['kind'], sense=c['sense'], params=c['params'],
-        shadows=[ShadowStep(**s) for s in c.get('shadows',[])]
-    ) for c in config['constraints']]
-
-    base_polys = [c.polygon(bounds, levels.get(c.id, 0)) for c in cons]
-    base_region = intersect_all(base_polys)
-
-    unlock_traces = []
-    unlock_rows = []
-    for c in cons:
-        cur = levels.get(c.id, 0)
-        if len(c.shadows) <= cur:
-            continue
-        alt_levels = dict(levels)
-        alt_levels[c.id] = cur + 1
-        alt_polys = [cc.polygon(bounds, alt_levels.get(cc.id,0)) for cc in cons]
-        new_region = intersect_all(alt_polys)
-        diff = new_region.difference(base_region)
-        area_gain = diff.area if not diff.is_empty else 0.0
-        step = c.shadows[cur]
-        hover = (f"Constraint: {c.id}<br>Next Δ={step.delta}"
-                 f"<br>ΔArea={area_gain:.2f}<br>Cost=€{step.cost:,.0f}"
-                 f"<br>Area/€={area_gain/step.cost if step.cost else np.nan:.6f}")
-        traces = shapely_to_traces(diff, name=f"unlock:{c.id}", hovertext=hover, fillalpha=0.50)
-        for t in traces:
-            t.customdata = [[c.id, cur, step.delta, step.cost]] * len(t.x)
-        unlock_traces.extend(traces)
-        unlock_rows.append({
-            "constraint": c.id,
-            "kind": c.kind,
-            "level": cur,
-            "delta": step.delta,
-            "cost": step.cost,
-            "area_gain": area_gain,
-            "area_per_cost": (area_gain/step.cost if step.cost else np.nan)
-        })
-    return base_region, unlock_traces, unlock_rows
-
-
-def default_config():
-    return {
-        "bounds": [0, 120, 0, 120],
-        "constraints": [
-            {"id":"machine_capacity","kind":"linear","sense":"le","params":{"a":1.0,"b":1.0,"c":100.0},
-             "shadows":[{"delta":10.0,"cost":15000},{"delta":10.0,"cost":25000}]},
-            {"id":"s1_max","kind":"linear","sense":"le","params":{"a":1.0,"b":0.0,"c":90.0},
-             "shadows":[{"delta":5.0,"cost":8000}]},
-            {"id":"s2_max","kind":"linear","sense":"le","params":{"a":0.0,"b":1.0,"c":80.0},
-             "shadows":[{"delta":10.0,"cost":9000}]},
-            {"id":"quad_mix","kind":"quadratic","sense":"le","params":{"a":0.01,"b":0.2,"c":10.0},
-             "shadows":[{"delta":5.0,"cost":12000}]},
-            {"id":"pw_downstream","kind":"piecewise","sense":"le","params":{"points":[[0,60],[40,50],[80,30],[120,25]]},
-             "shadows":[{"delta":7.0,"cost":11000},{"delta":5.0,"cost":18000}]}
-        ]
-    }
-
-
-# ------------------------------
-# Streamlit UI
-# ------------------------------
-
-st.set_page_config(page_title="Capacity Envelope — Streamlit", layout="wide")
-st.title("Capacity Envelope Unlock Simulator")
-
-colL, colR = st.columns([2.2, 1.3], gap="large")
+chosen = identify_clicked_constraint(clicked)
 
 with colR:
-    st.subheader("Config (JSON)")
-    cfg_text = st.text_area("", value=json.dumps(default_config(), indent=2), height=300)
-    cfg = json.loads(cfg_text)
+    st.markdown("### Controls")
+    st.write(f"**Feasible area (approx.):** {area_feasible:,.1f} (S1·S2 units)")
 
-    # Init levels
-    if "levels" not in st.session_state or set(st.session_state["levels"].keys()) != {c['id'] for c in cfg['constraints']}:
-        st.session_state["levels"] = {c['id']: 0 for c in cfg['constraints']}
+    if chosen:
+        st.success(f"Selected region ≈ constraint: **{chosen}**")
 
-    st.markdown("**Current relax levels**")
-    st.code("\n".join([f"- {k}: {v}" for k,v in st.session_state["levels"].items()]))
+    # Show shadow ladder + next cost
+    def next_shadow_info(name):
+        c = next((x for x in cfg["constraints"] if x["name"] == name), None)
+        if not c:
+            return None
+        lvl = st.session_state.levels.get(name, 0)
+        ladder = c.get("shadows", [])
+        if lvl >= len(ladder):
+            return {"status": "maxed"}
+        nxt = ladder[lvl]
+        return {"status": "ok", "next_delta": nxt["delta"], "next_cost": nxt["cost"], "level_after": lvl + 1}
 
-with colL:
-    st.subheader("Capacity Map")
-    base_region, unlock_traces, rows = compute_regions(cfg, st.session_state["levels"])
+    if chosen:
+        info = next_shadow_info(chosen)
+        if info and info["status"] == "ok":
+            # Rough Δarea estimate: integrate min(new envelope, cap) - old envelope (clipped >=0)
+            # Recompute chosen constraint with +delta
+            cdef = next(c for c in cfg["constraints"] if c["name"] == chosen)
+            lvl_tmp = st.session_state.levels[chosen]
+            st.session_state.levels[chosen] = lvl_tmp + 1
+            # recompute
+            curves_new = []
+            for c in cfg["constraints"]:
+                curves_new.append(constraint_curve(c))
+            curves_new = np.vstack(curves_new)
+            env_new = np.minimum(np.nanmin(curves_new, axis=0), cfg.get("bounds", {}).get("s2_max", S2_max))
+            dA = np.trapz(np.clip(env_new, S2_min, S2_max) - np.clip(envelope, S2_min, S2_max), S1)
+            dA = float(max(dA, 0.0))
+            # revert
+            st.session_state.levels[chosen] = lvl_tmp
 
-    # Build figure
-    x_min, x_max, y_min, y_max = cfg['bounds']
-    fig = go.Figure()
-    base_traces = shapely_to_traces(base_region, name='feasible_now', hovertext='Feasible region (current)', fillalpha=0.35)
-    for t in base_traces:
-        t.fillcolor = 'rgba(33,150,243,0.35)'
-        fig.add_trace(t)
-    palette = [
-        'rgba(244,67,54,0.45)','rgba(76,175,80,0.45)','rgba(255,193,7,0.45)',
-        'rgba(156,39,176,0.45)','rgba(0,150,136,0.45)','rgba(121,85,72,0.45)'
-    ]
-    for i, t in enumerate(unlock_traces):
-        t.fillcolor = palette[i % len(palette)]
-        fig.add_trace(t)
-    fig.update_layout(
-        xaxis_title='Stream 1 (x)', yaxis_title='Stream 2 (y)',
-        xaxis=dict(range=[x_min, x_max], zeroline=False, scaleratio=1),
-        yaxis=dict(range=[y_min, y_max], scaleanchor='x', zeroline=False),
-        margin=dict(l=10,r=10,t=10,b=10), showlegend=False, dragmode='pan')
+            st.info(f"Next relax for **{chosen}** → +ΔS2={info['next_delta']} at cost={info['next_cost']}.  \nEstimated **Δarea ≈ {dA:,.1f}**")
 
-    selected = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="plt")
-
-    clicked_info = None
-    if selected:
-        p = selected[0]
-        cd = p.get("customdata")
-        if cd and isinstance(cd, list) and len(cd) >= 4:
-            cid, lev, delta, cost = cd
-            clicked_info = {"constraint": cid, "level": int(lev), "delta": float(delta), "cost": float(cost)}
-
-    if clicked_info:
-        st.info(f"Selected: {clicked_info['constraint']} | next Δ={clicked_info['delta']} | cost=€{int(clicked_info['cost']):,}")
-    else:
-        st.caption("Click a colored patch to inspect an unlock option.")
-
-    c1, c2, c3 = st.columns([1,1,1])
-    with c1:
-        if st.button("Apply selected relax", disabled=(clicked_info is None)):
-            cid = clicked_info['constraint']
-            # Guard against exceeding available shadows
-            cons_map = {c['id']: c for c in cfg['constraints']}
-            max_level = len(cons_map[cid].get('shadows',[]))
-            cur = st.session_state['levels'].get(cid, 0)
-            if cur < max_level:
-                st.session_state['levels'][cid] = cur + 1
-                st.experimental_rerun()
-    with c2:
-        if st.button("Reset levels"):
-            st.session_state['levels'] = {c['id']: 0 for c in cfg['constraints']}
+    colA, colB, colC = st.columns(3)
+    with colA:
+        if st.button("Apply relax", use_container_width=True, type="primary", disabled=(chosen is None)):
+            if chosen:
+                c = next((x for x in cfg["constraints"] if x["name"] == chosen), None)
+                lvl = st.session_state.levels.get(chosen, 0)
+                if c and lvl < len(c.get("shadows", [])):
+                    st.session_state.levels[chosen] = lvl + 1
+                    st.experimental_rerun()
+    with colB:
+        if st.button("Reset levels", use_container_width=True):
+            for k in list(st.session_state.levels.keys()):
+                st.session_state.levels[k] = 0
+            st.experimental_rerun()
+    with colC:
+        if st.button("Recompute", use_container_width=True):
             st.experimental_rerun()
 
-with colR:
-    st.subheader("Unlock options (next step)")
-    if rows:
-        import pandas as pd
-        df = pd.DataFrame(rows).sort_values("area_per_cost", ascending=False)
-        st.dataframe(df, use_container_width=True, height=260)
-    else:
-        st.write("No further relax steps available.")
-
-st.caption("Areas are in squared stream-units. Piecewise/quadratic are polyline-approximated; adjust sampling in code if needed.")
+    # Show current levels table & costs sunk
+    rows = []
+    total_cost = 0.0
+    for c in cfg["constraints"]:
+        name = c["name"]
+        lvl = st.session_state.levels.get(name, 0)
+        cost = 0.0
+        for i in range(lvl):
+            cost += c.get("shadows", [])[i]["cost"]
+        total_cost += cost
+        rows.append({"constraint": name, "level": lvl, "cost_spent": cost})
+    st.dataframe(pd.DataFrame(rows))
+    st.write(f"**Total cost spent:** {total_cost:,.0f}")
