@@ -217,7 +217,7 @@ if have_shapely and old_vertices and new_vertices:
 
         # Plot delta (may be MultiPolygon)
         geoms = list(delta.geoms) if delta.geom_type == "MultiPolygon" else [delta]
-        for g in geoms:for g in geoms:
+        for g in geoms:
             if g.is_empty:
                 continue
 
