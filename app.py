@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import numpy as np
+
 
 st.set_page_config(page_title="Constraint Plot", layout="wide")
 st.title("Constraint plot")
@@ -50,18 +52,49 @@ if not y_cols:
 plot_df = df[[x_col] + y_cols].copy()
 long_df = plot_df.melt(id_vars=x_col, value_vars=y_cols, var_name="Series", value_name="Value")
 
-# Plot
-fig = px.line(long_df, x=x_col, y="Value", color="Series", markers=False)
-fig.update_traces(line=dict(width=4))  # thick lines
+# --- controls in sidebar ---
+upper_series = st.sidebar.selectbox("Upper bound series", y_candidates, index=0, key="upper")
+lower_series = st.sidebar.selectbox("Lower bound series", [c for c in y_candidates if c != upper_series], index=0, key="lower")
+shade_on = st.sidebar.checkbox("Highlight area between bounds", value=True)
 
-# Hard limits: axes start at 0
+# --- long format (kept) ---
+plot_df = df[[x_col] + y_cols].copy()
+long_df = plot_df.melt(id_vars=x_col, value_vars=y_cols, var_name="Series", value_name="Value")
+
+# --- base lines ---
+fig = px.line(long_df, x=x_col, y="Value", color="Series", markers=False)
+fig.update_traces(line=dict(width=4))
+
+# --- hard limits start at 0 ---
+xmax = max(0, float(long_df[x_col].max()))
+ymax = max(0, float(long_df["Value"].max()))
 fig.update_layout(
     template="plotly_white",
     hovermode="x unified",
     legend_title_text="",
     margin=dict(l=10, r=10, t=40, b=10),
-    xaxis=dict(range=[0, long_df[x_col].max()]),
-    yaxis=dict(range=[0, long_df["Value"].max()])
+    xaxis=dict(range=[0, xmax]),
+    yaxis=dict(range=[0, ymax])
 )
+
+# --- shaded area between two constraints ---
+if shade_on and upper_series in plot_df and lower_series in plot_df:
+    # align on a shared x-grid (union of x's)
+    x = np.sort(plot_df[x_col].unique())
+    u = np.interp(x, plot_df[x_col], plot_df[upper_series])
+    l = np.interp(x, plot_df[x_col], plot_df[lower_series])
+
+    # ensure correct ordering, clip to axes ≥ 0
+    top = np.maximum(u, l)
+    bot = np.minimum(u, l)
+    top = np.clip(top, 0, None)
+    bot = np.clip(bot, 0, None)
+    x = np.clip(x, 0, None)
+
+    # add two invisible lines to create a filled band
+    fig.add_scatter(x=x, y=top, mode="lines", line=dict(width=0), name=f"Upper: {upper_series}",
+                    showlegend=False)
+    fig.add_scatter(x=x, y=bot, mode="lines", line=dict(width=0), name=f"Lower: {lower_series}",
+                    fill="tonexty", fillcolor="rgba(255,0,0,0.20)", showlegend=False)
 
 st.plotly_chart(fig, use_container_width=True)
