@@ -138,9 +138,14 @@ def constraint_curve(c):
 curves = []
 names = []
 for c in cfg["constraints"]:
+    if c.get("type","excel_column")=="excel_column" and (excel_df is None or c["name"] not in excel_df.columns):
+        continue  # skip absent column
     curves.append(constraint_curve(c))
     names.append(c["name"])
-curves = np.vstack(curves)  # shape: (n_constraints, len(S1))
+if len(curves)==0:
+    st.error("No valid constraints available. Check Excel column names and JSON.")
+    st.stop()
+curves = np.vstack(curves)
 
 # Apply hard bounds on S2 if given
 s2_cap = cfg.get("bounds", {}).get("s2_max", S2_max)
