@@ -37,77 +37,75 @@ if not ycols:
     st.warning("Select at least one Y series in the sidebar.")
     st.stop()
 
-# ---- Classify constraint types ----
-st.sidebar.markdown("**Constraint types**")
-upper_set = st.sidebar.multiselect("Upper (≤)", ycols,
-                                   default=[c for c in ycols if df[c].diff().mean() <= 0])
-lower_set = st.sidebar.multiselect("Lower (≥)", [c for c in ycols if c not in upper_set],
-                                   default=[c for c in ycols if df[c].diff().mean() > 0])
 
-# ---- Base long df & plot ----
-plot_df = df[[xcol] + ycols].copy()
-long_df = plot_df.melt(id_vars=xcol, var_name="Series", value_name="Value")
+# ---- Prepare data (sorted X for correct interpolation) ----
+work = df[[xcol] + sel].dropna().copy()
+work = work.sort_values(by=xcol).reset_index(drop=True)
+X = work[xcol].to_numpy()
 
+# ---- Base figure (single) ----
+long_df = work.melt(id_vars=xcol, var_name="Series", value_name="Value")
 fig = px.line(long_df, x=xcol, y="Value", color="Series")
-fig.update_traces(line=dict(width=4))  # thick lines
-
-xmax = float(long_df[xcol].max())
-ymax = float(long_df["Value"].max())
+fig.update_traces(line=dict(width=4))
+xmax = float(long_df[xcol].max()); ymax = float(long_df["Value"].max())
 fig.update_layout(
-    template="plotly_white",
-    hovermode="x unified",
+    template="plotly_white", hovermode="x unified",
     xaxis=dict(range=[0, xmax], title=str(xcol)),
     yaxis=dict(range=[0, ymax], title="Value"),
     margin=dict(l=10, r=10, t=40, b=10)
 )
 
-# ---- Interaction: click to pick interval (two clicks) ----
+# ---- Click interaction: pick interval [x1, x2] ----
 if "clicks" not in st.session_state:
     st.session_state.clicks = []
-
 st.caption("Click twice on the chart to select an x-interval. Third click resets.")
 events = plotly_events(fig, click_event=True, select_event=False, hover_event=False)
-
 if events:
     x_clicked = events[0]["x"]
     st.session_state.clicks.append(x_clicked)
     if len(st.session_state.clicks) > 2:
         st.session_state.clicks = [x_clicked]  # reset
 
-# ---- Shade feasible band inside selected interval ----
-if len(st.session_state.clicks) == 2:
+# ---- Shade feasible band within interval ----
+if len(st.session_state.clicks) == 2 and (upper_set or lower_set):
     x1, x2 = sorted(st.session_state.clicks)
+    # grid clipped to axes ≥0
+    gx = np.linspace(max(0, X.min(), x1), max(0, x2), 600)
 
-    # common x grid over interval
-    X = plot_df[xcol].values
-    grid = np.linspace(max(0, X.min(), x1), max(0, x2), 400)
+    # interpolate all selected series on the grid
+    vals = {c: np.interp(gx, X, work[c].to_numpy()) for c in sel}
 
-    # interpolate series on grid
-    vals = {c: np.interp(grid, X, plot_df[c].values) for c in ycols}
+    # envelopes
+    if upper_set:
+        up = np.minimum.reduce([vals[c] for c in upper_set])
+    else:
+        up = np.full_like(gx, np.inf, dtype=float)
 
-    # envelopes: upper = min of uppers, lower = max of lowers and 0-axis
-    upper = np.minimum.reduce([vals[c] for c in upper_set]) if upper_set else np.inf*np.ones_like(grid)
-    lowers = [np.zeros_like(grid)]
+    low_components = [np.zeros_like(gx)]  # y >= 0
     if lower_set:
-        lowers += [vals[c] for c in lower_set]
-    lower = np.maximum.reduce(lowers)
+        low_components += [vals[c] for c in lower_set]
+    low = np.maximum.reduce(low_components)
 
-    mask = upper >= lower
-    gx, gtop, gbot = grid[mask], upper[mask], lower[mask]
+    # feasible mask (clip at y>=0)
+    mask = up >= low
+    gx_f, up_f, low_f = gx[mask], np.clip(up[mask], 0, None), np.clip(low[mask], 0, None)
 
-    if len(gx) > 0:
-        fig.add_scatter(x=gx, y=gtop, mode="lines", line=dict(width=0),
-                        name="Feasible upper", showlegend=False)
-        fig.add_scatter(x=gx, y=gbot, mode="lines", line=dict(width=0),
-                        fill="tonexty", fillcolor="rgba(255,0,0,0.25)",
-                        name="Feasible area", showlegend=True)
+    if gx_f.size > 0:
+        # add only the filled area (no extra visible lines/legend)
+        fig.add_scatter(
+            x=gx_f, y=up_f, mode="lines", line=dict(width=0),
+            hoverinfo="skip", showlegend=False
+        )
+        fig.add_scatter(
+            x=gx_f, y=low_f, mode="lines", line=dict(width=0),
+            fill="tonexty", fillcolor="rgba(255,0,0,0.28)",
+            hoverinfo="skip", name="Feasible area"
+        )
 
 # ---- Render ----
 st.plotly_chart(fig, use_container_width=True)
 
-# Reset button
-if st.button("Reset selection"):
+# Controls
+cols = st.columns(2)
+if cols[0].button("Reset selection"):
     st.session_state.clicks = []
-
-st.subheader("Data preview")
-st.dataframe(df.head())
