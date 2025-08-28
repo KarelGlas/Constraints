@@ -194,16 +194,6 @@ fig.update_layout(
 
 st.plotly_chart(fig, use_container_width=True)
 
-# -----------------------------
-# Bottleneck table (optional)
-# -----------------------------
-if show_bottleneck:
-    bneck, x_sorted = active_bottleneck(df, x_col, y_select, sense=sense)
-    if not bneck.empty:
-        tbl = pd.DataFrame({x_col: x_sorted, "active_bottleneck": bneck})
-        st.dataframe(tbl, use_container_width=True, height=260)
-    else:
-        st.info("Bottleneck table not available (insufficient/invalid data).")
 
 # -----------------------------
 # Tips
