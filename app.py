@@ -190,6 +190,39 @@ if show_shadow:
             )
         )
 
+# ---- Shadow feasibility region (based on selected shadow columns) ----
+shadow_vertices = []
+if show_shadow:
+    shadow_vertices = compute_feasible_polygon(
+        shadow_df, x_col, shadow_cols_select, sense=sense, baseline=baseline
+    )
+
+if shadow_vertices:
+    sh_x, sh_y = zip(*shadow_vertices)
+    sh_x = list(sh_x) + [sh_x[0]]  # close polygon
+    sh_y = list(sh_y) + [sh_y[0]]
+    shadow_output_xy = (np.array(sh_x) + np.array(sh_y)).tolist()  # X+Y for hover
+
+    fig.add_trace(
+        go.Scatter(
+            x=sh_x,
+            y=sh_y,
+            fill='toself',
+            fillcolor='rgba(250,150,150,0.25)',
+            line=dict(color='red', width=1, dash='dot'),
+            name="Feasible Region (Shadow)",
+            customdata=shadow_output_xy,
+            hovertemplate=(
+                "Feasible (Shadow)<br>"
+                + f"{x_col}=%{{x}}<br>"
+                  "Constraint=%{y}<br>"
+                  "Output (X+Y)=%{customdata}<br>"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+
 # Layout tweaks
 fig.update_layout(
     template="plotly_white",
