@@ -98,12 +98,32 @@ sense = st.sidebar.radio("Feasibility sense", options=["≤", "≥"], index=0, h
 baseline = st.sidebar.number_input("Baseline (other bound)", value=0.0, step=1.0, help="Lower bound for ‘≤’, upper bound for ‘≥’.")
 show_bottleneck = st.sidebar.checkbox("Show active bottleneck labels", value=True)
 
-# Shadow scenario
-shadow_df = None
+# -----------------------------
+# Shadow scenarios: selectable + feasible region
+# -----------------------------
+shadow_scenarios = {}
+
+# 1) Single 'shadows' sheet (optionally with a 'scenario' column)
 if any(s.lower() == 'shadows' for s in sheet_names):
-    shadow_df_raw = pd.read_excel(uploaded_file, sheet_name=[s for s in sheet_names if s.lower() == 'shadows'][0])
-    shadow_df = sanitize_numeric(shadow_df_raw)
-show_shadow = st.sidebar.checkbox("Show shadow constraints scenario", value=False) if shadow_df is not None else False
+    sh = sanitize_numeric(pd.read_excel(uploaded_file, sheet_name='shadows'))
+    if 'scenario' in sh.columns:
+        for name, g in sh.groupby('scenario'):
+            shadow_scenarios[str(name)] = g.drop(columns=['scenario'])
+    else:
+        shadow_scenarios['shadows'] = sh
+
+# 2) Any sheet starting with shadow_ or shadow:
+for s in sheet_names:
+    sl = s.lower()
+    if sl.startswith('shadow_') or sl.startswith('shadow:'):
+        shadow_scenarios[s] = sanitize_numeric(pd.read_excel(uploaded_file, sheet_name=s))
+
+chosen_shadows = []
+show_shadow_region = False
+if shadow_scenarios:
+    chosen_shadows = st.sidebar.multiselect("Shadow scenarios", list(shadow_scenarios.keys()))
+    show_shadow_region = st.sidebar.checkbox("Show shadow feasibility region", value=True)
+
 
 # -----------------------------
 # Build figure
@@ -163,21 +183,58 @@ for col in y_select:
         )
     )
 
-# Shadow scenario
-if show_shadow and (shadow_df is not None):
-    sh_cols = [c for c in shadow_df.columns if c != x_col and pd.api.types.is_numeric_dtype(shadow_df[c])]
+# --- plot selected shadow scenarios ---
+for name in chosen_shadows:
+    sdf = shadow_scenarios[name]
+    if x_col not in sdf.columns:
+        st.warning(f"Shadow '{name}' missing x-column '{x_col}'. Skipped.")
+        continue
+
+    # use only constraints that exist in both main selection and this shadow df
+    sh_cols = [c for c in y_select if c in sdf.columns and pd.api.types.is_numeric_dtype(sdf[c])]
+    if not sh_cols:
+        st.warning(f"Shadow '{name}' has no matching numeric constraint columns. Skipped.")
+        continue
+
+    # lines
     for col in sh_cols:
         fig.add_trace(
             go.Scatter(
-                x=shadow_df[x_col],
-                y=shadow_df[col],
-                name=f"{col} (Shadow)",
+                x=sdf[x_col], y=sdf[col],
+                name=f"{col} [{name}]",
                 mode='lines',
                 line=dict(width=2, dash='dash'),
                 hoverinfo='text',
-                hovertext=f"{col} increase costs €5,000"
+                hovertext=f"{col} in {name}"
             )
         )
+
+    # shadow feasible region (x + y > baseline)
+    if show_shadow_region:
+        v = compute_feasible_polygon(sdf, x_col, sh_cols, sense=sense, baseline=baseline)
+        if v:
+            px, py = zip(*v)
+            px, py = list(px) + [px[0]], list(py) + [py[0]]
+            fig.add_trace(
+                go.Scatter(
+                    x=px, y=py,
+                    fill='toself',
+                    fillcolor='rgba(120,120,120,0.18)',
+                    line=dict(color='rgba(90,90,90,0.8)', width=1, dash='dot'),
+                    name=f"Feasible [{name}]",
+                    hoverinfo='skip'
+                )
+            )
+
+    # ----- extend hard-axis bounds (if you use the clamp code) -----
+    if 'x_candidates' in locals():
+        x_candidates.append(pd.to_numeric(sdf[x_col], errors='coerce').max(skipna=True))
+    if 'y_candidates' in locals():
+        for c in sh_cols:
+            y_candidates.append(pd.to_numeric(sdf[c], errors='coerce').max(skipna=True))
+        if show_shadow_region and v:
+            _, vy = zip(*v)
+            y_candidates.append(np.nanmax(vy))
 
 # Layout tweaks
 fig.update_layout(
