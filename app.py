@@ -31,7 +31,6 @@ def load_df(file, sheet_name):
 
 df, default_x = load_df(uploaded, sheet)
 
-st.write("Preview", df.head())
 
 # --- Axis selections in sidebar ---
 numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
