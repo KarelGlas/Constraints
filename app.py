@@ -94,9 +94,7 @@ if len(y_select) == 0:
     st.stop()
 
 # Feasibility settings
-sense = st.sidebar.radio("Feasibility sense", options=["≤", "≥"], index=0, help="‘≤’: feasible under the tightest limit; ‘≥’: feasible above the loosest limit.")
-baseline = st.sidebar.number_input("Baseline (other bound)", value=0.0, step=1.0, help="Lower bound for ‘≤’, upper bound for ‘≥’.")
-show_bottleneck = st.sidebar.checkbox("Show active bottleneck labels", value=True)
+baseline = st.sidebar.number_input("Baseline (other bound)", value=32.0, step=1.0, help="Lower bound for ‘≤’, upper bound for ‘≥’.")
 
 # Shadow scenario — column selector (replaces binary toggle)
 shadow_df = None
