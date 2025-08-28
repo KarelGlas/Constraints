@@ -1,67 +1,57 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="Constraint Plot", layout="wide")
-st.title("Constraint plot")
-
-# --- Sidebar ---
-st.sidebar.header("Excel")
-uploaded = st.sidebar.file_uploader(
-    "Upload Excel (sheet with S1 + constraint columns; optional sheet 'shadows')",
-    type=["xlsx", "xls"]
-)
-
-if not uploaded:
-    st.info("Upload an Excel file in the sidebar to begin.")
+st.title("Debottlenecking Constraint Visualizer")
+uploaded_file = st.sidebar.file_uploader("Upload Excel with constraints", type=["xlsx"])
+if not uploaded_file:
     st.stop()
+xlsx = pd.ExcelFile(uploaded_file)
+main_sheet = st.sidebar.selectbox("Select main scenario sheet", [s for s in xlsx.sheet_names if s != 'shadows'])
+df = pd.read_excel(uploaded_file, sheet_name=main_sheet)
+x_col = 'S1' if 'S1' in df.columns else df.columns[0]  # x-axis column
+y_cols = [c for c in df.columns if c != x_col]
 
-# List sheets
-xlsx = pd.ExcelFile(uploaded)
-sheet = st.sidebar.selectbox("Select sheet", xlsx.sheet_names)
+# Load shadow scenario if available
+shadow_df = None
+if 'shadows' in xlsx.sheet_names:
+    shadow_df = pd.read_excel(uploaded_file, sheet_name='shadows')
 
-@st.cache_data
-def load_df(file, sheet_name):
-    df = pd.read_excel(file, sheet_name=sheet_name)
-    if "S1" in df.columns:
-        x_col = "S1"
-    else:
-        x_col = df.columns[0]
-    return df, x_col
+# Build the Plotly figure
+fig = go.Figure()
+# Plot base constraint lines
+for col in y_cols:
+    fig.add_trace(go.Scatter(x=df[x_col], y=df[col], name=col, mode='lines',
+                             line=dict(width=4)))  # base lines thick solid
+# Highlight feasible region
+vertices = compute_feasible_polygon(df, x_col, y_cols)  # user-defined function for intersections
+if vertices:
+    poly_x, poly_y = zip(*vertices)
+    poly_x += (poly_x[0],); poly_y += (poly_y[0],)  # close polygon
+    fig.add_trace(go.Scatter(x=poly_x, y=poly_y, fill='toself',
+                             fillcolor='rgba(150,150,250,0.3)', line=dict(color='blue', width=1),
+                             name="Feasible Region", hoverinfo='skip'))
 
-df, default_x = load_df(uploaded, sheet)
+# Add tooltips on lines
+for col in y_cols:
+    mid_x = df[x_col].iloc[len(df)//2]
+    mid_y = df[col].iloc[len(df)//2]
+    fig.add_trace(go.Scatter(x=[mid_x], y=[mid_y], mode='markers', 
+                             marker=dict(opacity=0), showlegend=False,
+                             hoverinfo='text', hovertext=f"Raise {col} limit to increase output"))
+    # Disable default hover on the line itself:
+    fig.update_traces(hoverinfo='skip', selector=dict(name=col))
 
+# Plot shadow constraints if toggled
+if shadow_df is not None:
+    if st.sidebar.checkbox("Show shadow constraints scenario"):
+        for col in [c for c in shadow_df.columns if c != x_col]:
+            fig.add_trace(go.Scatter(x=shadow_df[x_col], y=shadow_df[col],
+                                     name=f"{col} (Shadow)", mode='lines',
+                                     line=dict(width=3, dash='dash'),
+                                     hoverinfo='text', hovertext=f"{col} increase costs €5,000"))
 
-# --- Axis selections in sidebar ---
-numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-x_col = st.sidebar.selectbox(
-    "X axis", 
-    options=numeric_cols + [c for c in df.columns if c not in numeric_cols], 
-    index=(numeric_cols.index(default_x) if default_x in numeric_cols else 0)
-)
-y_candidates = [c for c in numeric_cols if c != x_col]
-y_cols = st.sidebar.multiselect("Y series", y_candidates, default=y_candidates)
-
-if not y_cols:
-    st.warning("Select at least one Y series in the sidebar.")
-    st.stop()
-
-# Melt for Plotly
-plot_df = df[[x_col] + y_cols].copy()
-long_df = plot_df.melt(id_vars=x_col, value_vars=y_cols, var_name="Series", value_name="Value")
-
-# Plot
-fig = px.line(long_df, x=x_col, y="Value", color="Series", markers=False)
-fig.update_traces(line=dict(width=4))  # thick lines
-
-# Hard limits: axes start at 0
-fig.update_layout(
-    template="plotly_white",
-    hovermode="x unified",
-    legend_title_text="",
-    margin=dict(l=10, r=10, t=40, b=10),
-    xaxis=dict(range=[0, long_df[x_col].max()]),
-    yaxis=dict(range=[0, long_df["Value"].max()])
-)
-
+# Final figure adjustments
+fig.update_layout(template="plotly_white", hovermode="closest",
+                  legend_title_text="", margin=dict(l=20, r=20, t=40, b=10))
 st.plotly_chart(fig, use_container_width=True)
