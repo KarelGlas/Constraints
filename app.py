@@ -185,9 +185,10 @@ for col in y_select:
         )
     )
 
-# Shadow scenario — only selected columns
+# Shadow scenario — only selected columns (with X+Y tooltip)
 if show_shadow:
     for col in shadow_cols_select:
+        combined_output_shadow = shadow_df[x_col] + shadow_df[col]
         fig.add_trace(
             go.Scatter(
                 x=shadow_df[x_col],
@@ -195,8 +196,15 @@ if show_shadow:
                 name=f"{col} (Shadow)",
                 mode='lines',
                 line=dict(width=2, dash='dash'),
-                hoverinfo='text',
-                hovertext=f"{col} (shadow)"
+                customdata=combined_output_shadow,
+                hovertemplate=(
+                    "Constraint (Shadow): <b>%{meta}</b><br>"
+                    + f"{x_col}=%{{x}}<br>"
+                      f"{col}=%{{y}}<br>"
+                      "Output (X+Y)=%{customdata}<br>"
+                    "<extra></extra>"
+                ),
+                meta=col,
             )
         )
 
