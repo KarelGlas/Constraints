@@ -177,10 +177,9 @@ for col in y_select:
         )
     )
 
-# Shadow scenario
-if show_shadow and (shadow_df is not None):
-    sh_cols = [c for c in shadow_df.columns if c != x_col and pd.api.types.is_numeric_dtype(shadow_df[c])]
-    for col in sh_cols:
+# Shadow scenario — only selected columns
+if show_shadow:
+    for col in shadow_cols_select:
         fig.add_trace(
             go.Scatter(
                 x=shadow_df[x_col],
@@ -188,6 +187,8 @@ if show_shadow and (shadow_df is not None):
                 name=f"{col} (Shadow)",
                 mode='lines',
                 line=dict(width=2, dash='dash'),
+                hoverinfo='text',
+                hovertext=f"{col} (shadow)"
             )
         )
 
