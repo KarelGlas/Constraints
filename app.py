@@ -18,16 +18,11 @@ def sanitize_numeric(df: pd.DataFrame) -> pd.DataFrame:
 def compute_feasible_polygon(df: pd.DataFrame, x_col: str, y_cols: list,
                              sense: str = "≤", baseline: float = 0.0):
     """
-    Build a polygon representing the feasible region given multiple constraints y_i(x).
-    Assumptions:
-      - '≤' sense: feasible is y between [baseline, min_i y_i(x)]
-      - '≥' sense: feasible is y between [max_i y_i(x), baseline]
-    Returns list of (x, y) vertices in order (closed polygon not required by caller).
+    Feasible region = points (x,y) where all constraints are satisfied AND x+y > baseline.
     """
     if len(y_cols) == 0 or x_col not in df.columns:
         return []
 
-    # Sort by x and drop rows with any NaN in required cols
     work = df[[x_col] + y_cols].dropna().sort_values(by=x_col)
     if work.empty:
         return []
@@ -37,22 +32,24 @@ def compute_feasible_polygon(df: pd.DataFrame, x_col: str, y_cols: list,
 
     if sense == "≤":
         envelope = np.min(Y, axis=1)
-        lower = np.full_like(envelope, float(baseline))
-        # polygon path: along x with envelope (top), then back along reversed x at lower (bottom)
+        # baseline curve: lowest allowed y so that x+y > baseline
+        lower = baseline - x
+        feasible_top = np.minimum(envelope, np.max([lower, envelope], axis=0))
         xs = np.concatenate([x, x[::-1]])
-        ys = np.concatenate([envelope, lower[::-1]])
+        ys = np.concatenate([feasible_top, lower[::-1]])
     else:  # '≥'
         envelope = np.max(Y, axis=1)
-        upper = np.full_like(envelope, float(baseline))
+        upper = baseline - x  # now acts as cap
+        feasible_bottom = np.maximum(envelope, np.min([upper, envelope], axis=0))
         xs = np.concatenate([x, x[::-1]])
-        ys = np.concatenate([upper, envelope[::-1]])
+        ys = np.concatenate([upper, feasible_bottom[::-1]])
 
-    # Remove possible self-crossing by dropping nan/inf and compressing duplicates
     mask = np.isfinite(xs) & np.isfinite(ys)
     xs, ys = xs[mask], ys[mask]
     if len(xs) < 3:
         return []
     return list(zip(xs, ys))
+
 
 def active_bottleneck(df: pd.DataFrame, x_col: str, y_cols: list, sense: str = "≤"):
     """Return a Series with the constraint name that governs (min or max) at each x."""
