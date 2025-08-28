@@ -1,6 +1,6 @@
 streamlit
-plotly
-shapely
+pandas
 numpy
-streamlit-plotly-events
+plotly
 openpyxl
+streamlit-plotly-events
