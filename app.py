@@ -124,8 +124,7 @@ show_shadow = bool(shadow_df is not None and x_col in (shadow_df.columns if shad
 # -----------------------------
 fig = go.Figure()
 
-# Base constraint lines
-palette_width = 3
+# Base constraint lines (with hover)
 for col in y_select:
     fig.add_trace(
         go.Scatter(
@@ -133,11 +132,18 @@ for col in y_select:
             y=df[col],
             name=col,
             mode='lines',
-            line=dict(width=palette_width),
-            hoverinfo='skip'  # disable default hover on lines
+            line=dict(width=3),
+            # rich tooltip everywhere along the line
+            hovertemplate=(
+                "Constraint: <b>%{meta}</b><br>"
+                + f"{x_col}=%{{x}}<br>"
+                  "value=%{y}<br>"
+                  "Tip: raise this limit to increase output"
+                "<extra></extra>"
+            ),
+            meta=col,
         )
     )
-
 # Feasible region polygon
 vertices = compute_feasible_polygon(df, x_col, y_select, sense=sense, baseline=baseline)
 if vertices:
